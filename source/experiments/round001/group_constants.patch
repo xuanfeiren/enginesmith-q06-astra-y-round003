@@ -1,0 +1,115 @@
+--- a/kernels/prefill_sb.py
++++ b/kernels/prefill_sb.py
+@@ -17,7 +17,7 @@
+ import nki.language as nl
+ import nki.isa as nisa
+ from layer_decode import _consts, HT, HID, D, EPS
+-from attn_prefill import attn_prefill_sb
++from p_attnhoist import attn_prefill_sb
+ 
+ NQL, NKL, ITL = 8, 4, 12
+ import os as _os
+@@ -135,16 +135,20 @@
+         _hd(dst=kcache[0, pid, j, :, t0:t0 + S], src=ksb[:, j, t0:t0 + S])
+ 
+ 
+-def _layer_sb(plen, s_h, ln1, ln2, qn, kn, wqkv, wo, wgu, wd, rot, cosT, sinT, kcache, vcache):
++def _layer_sb(plen, s_h, ln1, ln2, qn, kn, wqkv, wo, wgu, wd, rot, cosT, sinT, kcache, vcache, consts=None):
+     S = s_h.shape[2]
+     NB = S // 128
+     l = 0
+     pid = nl.program_id(0)
+-    ones, ident, idf, ones16 = _consts()
+-    onesb = nl.ndarray((128, 128), dtype=nl.bfloat16, buffer=nl.sbuf)
+-    nisa.memset(dst=onesb, value=1.0)
+-    rot_sb = nl.ndarray((128, 128), dtype=nl.bfloat16, buffer=nl.sbuf)
+-    nisa.dma_copy(dst=rot_sb, src=rot)
++    ac = None
++    if consts is None:
++        ones, ident, idf, ones16 = _consts()
++        onesb = nl.ndarray((128, 128), dtype=nl.bfloat16, buffer=nl.sbuf)
++        nisa.memset(dst=onesb, value=1.0)
++        rot_sb = nl.ndarray((128, 128), dtype=nl.bfloat16, buffer=nl.sbuf)
++        nisa.dma_copy(dst=rot_sb, src=rot)
++    else:
++        onesb, rot_sb, ident, ac = consts
+     w1 = nl.ndarray((128, HT), dtype=nl.float32, buffer=nl.sbuf)
+     _hd(dst=w1, src=ln1[l])
+     w2 = nl.ndarray((128, HT), dtype=nl.float32, buffer=nl.sbuf)
+@@ -194,7 +198,7 @@
+ 
+     # ================= B
+     osb = nl.ndarray((128, NQL, S), dtype=nl.bfloat16, buffer=nl.sbuf)
+-    attn_prefill_sb(qsb, ksb, vsb, osb, S)
++    attn_prefill_sb(qsb, ksb, vsb, osb, S, consts=ac)
+ 
+     # ================= C: o_proj K-split (this core's 8 heads) + exchange + residual
+     part = nl.ndarray((128, HT, S), dtype=nl.float32, buffer=nl.sbuf)
+--- a/kernels/attn_prefill.py
++++ b/kernels/attn_prefill.py
+@@ -288,11 +288,14 @@
+         _ap_s3(n, items, e_l, rinv_l, eT_l, vts, idf, ones, oT, pid, NB)
+ 
+ 
+-def attn_prefill_sb(qsb, ksb, vsb, osb, S, DEPTH=2):
++def attn_prefill_sb(qsb, ksb, vsb, osb, S, DEPTH=2, consts=None):
+     """attn_prefill_pipe on SBUF-resident tiles of this core's heads: qsb [128 d, 8, S], ksb [128 d, 4, S],
+     vsb [128 t, S / 128, 4, 128 d] (bf16); output osb [128 d, 8, S] bf16 (SBUF)."""
+     NB = S // 128
+-    idf, ident, msk, ones = _attn_consts()
++    if consts is None:
++        idf, ident, msk, ones = _attn_consts()
++    else:
++        idf, ident, msk, ones = consts
+     kts = []
+     vts = []
+     qts = []
+--- a/experiments/group.py
++++ b/experiments/group.py
+@@ -1,13 +1,21 @@
+ import nki
+ import nki.isa as ni
+-from p_sbhint import _layer_sb
++import nki.language as nl
++from p_sbhoist import _layer_sb
++from p_attnhoist import _attn_consts
+ 
+ @nki.jit
+ def pf_group(plen,s_h,ln1,ln2,qn,kn,wqkv,wo,wgu,wd,rot,cosT,sinT,kcache,vcache):
++    ac=_attn_consts()
++    onesb=nl.ndarray((128,128),dtype=nl.bfloat16,buffer=nl.sbuf)
++    ni.memset(dst=onesb,value=1.0)
++    rot_sb=nl.ndarray((128,128),dtype=nl.bfloat16,buffer=nl.sbuf)
++    ni.dma_copy(dst=rot_sb,src=rot)
++    consts=(onesb,rot_sb,ac[1],ac)
+     L=ln1.shape[0]
+     for l in range(L):
+         out=_layer_sb(plen,s_h,ln1[l:l+1],ln2[l:l+1],qn[l:l+1],kn[l:l+1],wqkv[l:l+1],wo[l:l+1],
+-                      wgu[l:l+1],wd[l:l+1],rot,cosT,sinT,kcache[l:l+1],vcache[l:l+1])
++                      wgu[l:l+1],wd[l:l+1],rot,cosT,sinT,kcache[l:l+1],vcache[l:l+1],consts)
+         if l+1<L:
+             ni.core_barrier(data=s_h,cores=(0,1))
+     return out
+--- a/host/engine.cpp
++++ b/host/engine.cpp
+@@ -217,8 +217,9 @@
+       size_t full = dev.sz[nm];
+       nrt_tensor_t* x = it->second;
+       if (full != ti.size) {
+-        if (layer >= 0 && full == (size_t)L * ti.size) {
+-          CK(nrt_tensor_allocate_slice(x, (size_t)layer * ti.size, ti.size, ti.name, &x));
++        if (layer >= 0 && full % L == 0 && ti.size % (full / L) == 0 &&
++            (size_t)layer * (full / L) + ti.size <= full) {
++          CK(nrt_tensor_allocate_slice(x, (size_t)layer * (full / L), ti.size, ti.name, &x));
+         } else if (full > ti.size && (nm == "ids" || nm.rfind("s_", 0) == 0)) {
+           CK(nrt_tensor_allocate_slice(x, 0, ti.size, ti.name, &x));   // max-size buffer, prefix used
+         } else die(neff + ": size mismatch for " + nm);
+@@ -328,7 +329,7 @@
+       v.push_back(bind("pf_emb" + sfx, -1, rn));
+       // buckets <= SB_MAX: the SBUF-resident layer (prefill_sb.py, decode weight layouts); else the phased one
+       const char* lay = s <= SB_MAX ? "pf_sb" : s <= SBC_MAX ? "pf_sbc" : "pf_layer";
+-      for (int l = 0; l < L - 1; l++) v.push_back(bind(lay + sfx, l, rn));
++      for (int l = 0; l < L - 1; l += (s == 256 ? 3 : 1)) v.push_back(bind(lay + sfx, l, rn));
+       // last layer: its KV cache writes for every prompt token (pf_kv), then the rest of it for the last token only,
+       // the LM head and the argmax (pf_tail, the decode layer code at pos = plen - 1)
+       v.push_back(bind("pf_kv" + sfx, L - 1, rn));

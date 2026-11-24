@@ -1,0 +1,123 @@
+--- a/kernels/attn_prefill.py
++++ b/kernels/attn_prefill.py
+@@ -152,13 +152,12 @@
+     ps = ps_l[n]
+     # causal mask on the diagonal block, in place in PSUM; then one max, one exp (+ row sum) over all K keys
+     nisa.tensor_tensor(dst=ps[:, i * 128:K], data1=ps[:, i * 128:K], data2=msk, op=nl.add)
+-    mx = nl.ndarray((128, 1), dtype=nl.float32, buffer=nl.sbuf)
+-    nisa.tensor_reduce(dst=mx, op=nl.maximum, data=ps[:, 0:K], axis=1)
+-    nm = nl.ndarray((128, 1), dtype=nl.float32, buffer=nl.sbuf)
+-    nisa.tensor_scalar(dst=nm, data=mx, op0=nl.multiply, operand0=-SCALE, engine=OFFE)
++    nm = nl.ndarray((128,1),dtype=nl.float32,buffer=nl.sbuf)
++    nisa.tensor_scalar_reduce(dst=ps[:,0:K],data=ps[:,0:K],op0=nl.multiply,operand0=-SCALE,
++                              reduce_op=nl.minimum,reduce_res=nm)
+     e = nl.ndarray((128, K), dtype=nl.bfloat16, buffer=nl.sbuf)
+     sm = nl.ndarray((128, 1), dtype=nl.float32, buffer=nl.sbuf)
+-    nisa.activation_reduce(dst=e, op=nl.exp, data=ps[:, 0:K], reduce_op=nl.add, reduce_res=sm, bias=nm, scale=SCALE)
++    nisa.activation_reduce(dst=e, op=nl.exp, data=ps[:, 0:K], reduce_op=nl.add, reduce_res=sm, bias=nm, scale=-1.0)
+     pi = n // 2
+     if hh == 0:
+         rinv_l[pi] = nl.ndarray((128, 2), dtype=nl.float32, buffer=nl.sbuf)
+@@ -336,60 +335,40 @@
+ 
+ 
+ def _ab_s1(n, items, qts, kts, msk, pred, sc_l, mx_l, S):
+-    """scores of item n: QK in PSUM sections of SEC keys -> fp32 SBUF row (VectorE copy fused with the row max per
+-    section); the diagonal 128-key block gets the causal mask."""
+     g = items[n][0]
+     i = items[n][1]
+     hh = items[n][2]
+     K = (i + 1) * 128
+     D0 = i * 128
+-    NSEC = (S + SEC - 1) // SEC + 1
+     sc = nl.ndarray((128, K), dtype=nl.float32, buffer=nl.sbuf)
+-    mx = nl.ndarray((128, NSEC), dtype=nl.float32, buffer=nl.sbuf)
++    nm = nl.ndarray((128, 1), dtype=nl.float32, buffer=nl.sbuf)
+     k0 = 0
+-    s = 0
+     while k0 < K:
+-        k1 = k0 + SEC
+-        if k1 > K:
+-            k1 = K
++        k1 = min(k0 + SEC, K)
+         ps = nl.ndarray((128, k1 - k0), dtype=nl.float32, buffer=nl.psum)
+         c0 = k0
+         while c0 < k1:
+-            w = 512
+-            if k1 - c0 < 512:
+-                w = k1 - c0
+-            nisa.nc_matmul(dst=ps[:, c0 - k0:c0 - k0 + w], stationary=qts[2 * g + hh][:, i * 128:(i + 1) * 128],
+-                           moving=kts[g][:, c0:c0 + w])
++            w = min(512, k1 - c0)
++            nisa.nc_matmul(dst=ps[:, c0-k0:c0-k0+w], stationary=qts[2*g+hh][:,i*128:(i+1)*128],
++                           moving=kts[g][:,c0:c0+w])
+             c0 += w
+-        e0 = k1
+-        if e0 > D0:
+-            e0 = D0
++        e0 = min(k1, D0)
+         if e0 > k0:
+-            if ACC:
+-                cmd = nisa.reduce_cmd.reduce
+-                if k0 == 0:
+-                    cmd = nisa.reduce_cmd.reset_reduce
+-                nisa.tensor_scalar_reduce(dst=sc[:, k0:e0], data=ps[:, 0:e0 - k0], op0=nl.add, operand0=0.0,
+-                                          reduce_op=nl.maximum, reduce_res=None, reduce_cmd=cmd)
+-            else:
+-                nisa.tensor_scalar_reduce(dst=sc[:, k0:e0], data=ps[:, 0:e0 - k0], op0=nl.add, operand0=0.0,
+-                                          reduce_op=nl.maximum, reduce_res=mx[:, s:s + 1])
+-                s += 1
++            cmd = nisa.reduce_cmd.reduce
++            if k0 == 0:
++                cmd = nisa.reduce_cmd.reset_reduce
++            nisa.tensor_scalar_reduce(dst=sc[:,k0:e0],data=ps[:,0:e0-k0],op0=nl.multiply,operand0=-SCALE,
++                                      reduce_op=nl.minimum,reduce_res=None,reduce_cmd=cmd)
+         if k1 == K:
+-            if ACC:
+-                cmd = nisa.reduce_cmd.reduce
+-                if D0 == 0:
+-                    cmd = nisa.reduce_cmd.reset_reduce
+-                nisa.select_reduce(dst=sc[:, D0:K], predicate=pred, on_true=ps[:, D0 - k0:K - k0], on_false=NEG,
+-                                   reduce_res=mx[:, 0:1], reduce_cmd=cmd, reduce_op=nl.maximum)
+-                s = 1
+-            else:
+-                nisa.tensor_tensor(dst=sc[:, D0:K], data1=ps[:, D0 - k0:K - k0], data2=msk, op=nl.add)
+-                nisa.tensor_reduce(dst=mx[:, s:s + 1], op=nl.maximum, data=sc[:, D0:K], axis=1)
+-                s += 1
++            nisa.select_reduce(dst=ps[:,D0-k0:K-k0],predicate=pred,on_true=ps[:,D0-k0:K-k0],on_false=NEG)
++            cmd = nisa.reduce_cmd.reduce
++            if D0 == 0:
++                cmd = nisa.reduce_cmd.reset_reduce
++            nisa.tensor_scalar_reduce(dst=sc[:,D0:K],data=ps[:,D0-k0:K-k0],op0=nl.multiply,operand0=-SCALE,
++                                      reduce_op=nl.minimum,reduce_res=nm,reduce_cmd=cmd)
+         k0 = k1
+     sc_l[n] = sc
+-    mx_l[n] = (mx, s)
++    mx_l[n] = (nm,1)
+ 
+ 
+ def _ab_s2(n, items, sc_l, mx_l, e_l, rinv_l, eT_l, NB):
+@@ -398,21 +377,10 @@
+     hh = items[n][2]
+     K = (i + 1) * 128
+     sc = sc_l[n]
+-    mx = mx_l[n][0]
+-    ns = mx_l[n][1]
+-    m = nl.ndarray((128, 1), dtype=nl.float32, buffer=nl.sbuf)
+-    if ns > 1:
+-        nisa.tensor_reduce(dst=m, op=nl.maximum, data=mx[:, 0:ns], axis=1)
+-    else:
+-        nisa.tensor_copy(dst=m, src=mx[:, 0:1])
+-    nm = nl.ndarray((128, 1), dtype=nl.float32, buffer=nl.sbuf)
+-    if NMACT:
+-        nisa.activation(dst=nm, op=nl.copy, data=m, scale=-SCALE)
+-    else:
+-        nisa.tensor_scalar(dst=nm, data=m, op0=nl.multiply, operand0=-SCALE, engine=nisa.engine.vector)
++    nm = mx_l[n][0]
+     e = nl.ndarray((128, K), dtype=nl.bfloat16, buffer=nl.sbuf)
+     sm = nl.ndarray((128, 1), dtype=nl.float32, buffer=nl.sbuf)
+-    nisa.activation_reduce(dst=e, op=nl.exp, data=sc, reduce_op=nl.add, reduce_res=sm, bias=nm, scale=SCALE)
++    nisa.activation_reduce(dst=e, op=nl.exp, data=sc, reduce_op=nl.add, reduce_res=sm, bias=nm, scale=-1.0)
+     pi = n // 2
+     if hh == 0:
+         rinv_l[pi] = nl.ndarray((128, 2), dtype=nl.float32, buffer=nl.sbuf)

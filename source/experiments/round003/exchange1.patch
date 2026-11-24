@@ -1,0 +1,50 @@
+--- a/kernels/prefill_sb.py
++++ b/kernels/prefill_sb.py
+@@ -74,6 +74,13 @@
+     s = nl.ndarray((128, HT, S), dtype=nl.float32, buffer=nl.sbuf)
+     nisa.tensor_tensor(dst=s, data1=part, data2=other, op=nl.add)
+     return s
++
++
++def _xchg_into(dst, part, pid):
++    other = nl.ndarray(part.shape, dtype=nl.float32, buffer=nl.sbuf)
++    nisa.sendrecv(src=part, dst=other, send_to_rank=1-pid, recv_from_rank=1-pid, pipe_id=0,
++                  dma_engine=nisa.dma_engine.dma)
++    nisa.tensor_tensor(dst=dst, data1=part, data2=other, op=nl.add)
+ 
+ 
+ def _sa_m(nt, x1, wq, S, ps_l):
+@@ -309,13 +316,15 @@
+     for c in range(NC):
+         t0 = c * CH
+         part = nl.ndarray((128, HT, CH), dtype=nl.float32, buffer=nl.sbuf)
++        sc = nl.ndarray((128, HT, CH), dtype=nl.float32, buffer=nl.sbuf)
+         for nt in range(HT):
+             ps = nl.ndarray((128, CH), dtype=nl.float32, buffer=nl.psum)
+             for kt in range(NQL):
+                 nisa.nc_matmul(dst=ps, stationary=wo_sb[:, (nt * NQL + kt) * 128:(nt * NQL + kt + 1) * 128],
+                                moving=osb[:, kt, t0:t0 + CH])
+             nisa.tensor_copy(dst=part[:, nt, :], src=ps)
+-        sc = _xchg_add(part, pid, CH)
++            if (nt + 1) % 1 == 0:
++                _xchg_into(sc[:, nt + 1 - 1:nt + 1, :], part[:, nt + 1 - 1:nt + 1, :], pid)
+         h2 = nl.ndarray((128, HT, CH), dtype=nl.float32, buffer=nl.sbuf)
+         nisa.tensor_tensor(dst=h2, data1=hs[c], data2=sc, op=nl.add)
+         h2s.append(h2)
+@@ -338,13 +347,15 @@
+             nisa.activation(dst=sg, op=nl.silu, data=pg)
+             nisa.tensor_tensor(dst=act[:, i, :], data1=sg, data2=pu, op=nl.multiply)
+         part2 = nl.ndarray((128, HT, CH), dtype=nl.float32, buffer=nl.sbuf)
++        sd = nl.ndarray((128, HT, CH), dtype=nl.float32, buffer=nl.sbuf)
+         for nt in range(HT):
+             ps = nl.ndarray((128, CH), dtype=nl.float32, buffer=nl.psum)
+             for kt in range(ITL):
+                 nisa.nc_matmul(dst=ps, stationary=wd_sb[:, (nt * ITL + kt) * 128:(nt * ITL + kt + 1) * 128],
+                                moving=act[:, kt, :])
+             nisa.tensor_copy(dst=part2[:, nt, :], src=ps)
+-        sd = _xchg_add(part2, pid, CH)
++            if (nt + 1) % 1 == 0:
++                _xchg_into(sd[:, nt + 1 - 1:nt + 1, :], part2[:, nt + 1 - 1:nt + 1, :], pid)
+         h3 = nl.ndarray((128, HT, CH), dtype=nl.float32, buffer=nl.sbuf)
+         nisa.tensor_tensor(dst=h3, data1=h2s[c], data2=sd, op=nl.add)
+         _hd(dst=s_h[:, :, t0:t0 + CH], src=h3)

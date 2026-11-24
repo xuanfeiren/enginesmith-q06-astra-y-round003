@@ -1,0 +1,16 @@
+--- a/kernels/attn_prefill.py
++++ b/kernels/attn_prefill.py
+@@ -468,11 +468,10 @@
+     sc = sc_l[n]
+     mx = mx_l[n][0]
+     ns = mx_l[n][1]
+-    m = nl.ndarray((128, 1), dtype=nl.float32, buffer=nl.sbuf)
++    m = mx[:, 0:1]
+     if ns > 1:
++        m = nl.ndarray((128, 1), dtype=nl.float32, buffer=nl.sbuf)
+         nisa.tensor_reduce(dst=m, op=nl.maximum, data=mx[:, 0:ns], axis=1)
+-    else:
+-        nisa.tensor_copy(dst=m, src=mx[:, 0:1])
+     nm = nl.ndarray((128, 1), dtype=nl.float32, buffer=nl.sbuf)
+     if NMACT:
+         nisa.activation(dst=nm, op=nl.copy, data=m, scale=-SCALE)

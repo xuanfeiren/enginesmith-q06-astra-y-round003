@@ -1,0 +1,83 @@
+--- a/kernels/prefill_sb.py
++++ b/kernels/prefill_sb.py
+@@ -21,6 +21,7 @@
+ 
+ NQL, NKL, ITL = 8, 4, 12
+ import os as _os
++DPIPE = int(_os.environ.get('SB_DPIPE', '1'))
+ APD = int(_os.environ.get('SB_APD', '3'))
+ XCG = int(_os.environ.get('SB_XCG', '0'))
+ VCA = int(_os.environ.get('SB_VCA', '0'))
+@@ -133,6 +134,33 @@
+         j = nt - NQL
+         nisa.tensor_tensor(dst=ksb[:, j, t0:t0 + S], data1=xc, data2=xs, op=nl.add, engine=nisa.engine.gpsimd)
+         _hd(dst=kcache[0, pid, j, :, t0:t0 + S], src=ksb[:, j, t0:t0 + S])
++
++
++def _pd_m(i, x2, wg, C, pgs, pus):
++    pg = nl.ndarray((128, C), dtype=nl.float32, buffer=nl.psum)
++    for kt in range(HT):
++        nisa.nc_matmul(dst=pg, stationary=wg[:, (i * HT + kt) * 128:(i * HT + kt + 1) * 128], moving=x2[:, kt, :])
++    pu = nl.ndarray((128, C), dtype=nl.float32, buffer=nl.psum)
++    for kt in range(HT):
++        nisa.nc_matmul(dst=pu, stationary=wg[:, ((ITL + i) * HT + kt) * 128:((ITL + i) * HT + kt + 1) * 128], moving=x2[:, kt, :])
++    pgs[i] = pg
++    pus[i] = pu
++
++
++def _gate_up_pipe(x2, wg, act, C):
++    pgs = []
++    pus = []
++    for i in range(ITL):
++        pgs.append(0)
++        pus.append(0)
++    for i in range(DPIPE):
++        _pd_m(i, x2, wg, C, pgs, pus)
++    for i in range(ITL):
++        if i + DPIPE < ITL:
++            _pd_m(i + DPIPE, x2, wg, C, pgs, pus)
++        sg = nl.ndarray((128, C), dtype=nl.float32, buffer=nl.sbuf)
++        nisa.activation(dst=sg, op=nl.silu, data=pgs[i])
++        nisa.tensor_tensor(dst=act[:, i, :], data1=sg, data2=pus[i], op=nl.multiply)
+ 
+ 
+ def _layer_sb(plen, s_h, ln1, ln2, qn, kn, wqkv, wo, wgu, wd, rot, cosT, sinT, kcache, vcache):
+@@ -211,17 +239,7 @@
+     # ================= D: norm2 + gate/up (this core's 12 intermediate tiles) + SiLU * up
+     x2 = _norm_sb(h2, w2, onesb, S)
+     act = nl.ndarray((128, ITL, S), dtype=nl.bfloat16, buffer=nl.sbuf)
+-    for i in range(ITL):
+-        pg = nl.ndarray((128, S), dtype=nl.float32, buffer=nl.psum)
+-        for kt in range(HT):
+-            nisa.nc_matmul(dst=pg, stationary=wg[:, (i * HT + kt) * 128:(i * HT + kt + 1) * 128], moving=x2[:, kt, :])
+-        pu = nl.ndarray((128, S), dtype=nl.float32, buffer=nl.psum)
+-        for kt in range(HT):
+-            nisa.nc_matmul(dst=pu, stationary=wg[:, ((ITL + i) * HT + kt) * 128:((ITL + i) * HT + kt + 1) * 128],
+-                           moving=x2[:, kt, :])
+-        sg = nl.ndarray((128, S), dtype=nl.float32, buffer=nl.sbuf)
+-        nisa.activation(dst=sg, op=nl.silu, data=pg)
+-        nisa.tensor_tensor(dst=act[:, i, :], data1=sg, data2=pu, op=nl.multiply)
++    _gate_up_pipe(x2, wg, act, S)
+ 
+     # ================= E: down K-split + exchange + residual
+     part2 = nl.ndarray((128, HT, S), dtype=nl.float32, buffer=nl.sbuf)
+@@ -325,18 +343,7 @@
+         t0 = c * CH
+         x2 = _norm_sb(h2s[c], w2, onesb, CH)
+         act = nl.ndarray((128, ITL, CH), dtype=nl.bfloat16, buffer=nl.sbuf)
+-        for i in range(ITL):
+-            pg = nl.ndarray((128, CH), dtype=nl.float32, buffer=nl.psum)
+-            for kt in range(HT):
+-                nisa.nc_matmul(dst=pg, stationary=wg[:, (i * HT + kt) * 128:(i * HT + kt + 1) * 128],
+-                               moving=x2[:, kt, :])
+-            pu = nl.ndarray((128, CH), dtype=nl.float32, buffer=nl.psum)
+-            for kt in range(HT):
+-                nisa.nc_matmul(dst=pu, stationary=wg[:, ((ITL + i) * HT + kt) * 128:((ITL + i) * HT + kt + 1) * 128],
+-                               moving=x2[:, kt, :])
+-            sg = nl.ndarray((128, CH), dtype=nl.float32, buffer=nl.sbuf)
+-            nisa.activation(dst=sg, op=nl.silu, data=pg)
+-            nisa.tensor_tensor(dst=act[:, i, :], data1=sg, data2=pu, op=nl.multiply)
++        _gate_up_pipe(x2, wg, act, CH)
+         part2 = nl.ndarray((128, HT, CH), dtype=nl.float32, buffer=nl.sbuf)
+         for nt in range(HT):
+             ps = nl.ndarray((128, CH), dtype=nl.float32, buffer=nl.psum)

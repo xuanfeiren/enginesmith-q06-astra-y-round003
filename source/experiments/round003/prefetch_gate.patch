@@ -1,0 +1,15 @@
+--- a/kernels/prefill_sb.py
++++ b/kernels/prefill_sb.py
+@@ -298,10 +298,11 @@
+         _sa_e2(15, yb_l, rot_sb, cs[:, t0:t0 + CH], sn[:, t0:t0 + CH], qsb, ksb, kcache, pid, CH, t0)
+     wo_sb = _load_w(wo[l, pid], HT * NQL * 128, 2)
+ 
++    wg = _load_w(wgu[l, pid], 2 * ITL * HT * 128, 2)
++
+     # ================= B
+     osb = nl.ndarray((128, NQL, S), dtype=nl.bfloat16, buffer=nl.sbuf)
+     attn_prefill_sb(qsb, ksb, vsb, osb, S)
+-    wg = _load_w(wgu[l, pid], 2 * ITL * HT * 128, 2)
+     wd_sb = _load_w(wd[l, pid], HT * ITL * 128, 2)
+ 
+     # ================= C

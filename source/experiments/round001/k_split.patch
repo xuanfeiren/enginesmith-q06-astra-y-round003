@@ -1,0 +1,223 @@
+--- a/kernels/prefill_lnc2.py
++++ b/kernels/prefill_lnc2.py
+@@ -12,14 +12,15 @@
+   C  o_proj, N-split (output tiles 4c..4c+3, all 16 heads as K) + residual, in place into h
+   D  norm2 + gate/up (intermediate tiles 12c..12c+11) + SiLU*up -> act_s
+   E  down, N-split (output tiles 4c..4c+3, all 24 intermediate tiles as K) + residual, in place into h
+-Inputs: ids [S, 1] int32, plen [1, 1] int32, toks, embed, ln1, ln2, qn, kn, wqkv (decode split), wo_p [L, 2, 128,
+-4*16*128], wgu (decode split), wd_p [L, 2, 128, 4*24*128], normf, wlm (decode split), rot, cosT / sinT [128, TMAX]
++Inputs: ids [S, 1] int32, plen [1, 1] int32, toks, embed, ln1, ln2, qn, kn, wqkv (decode split), wo [L, 2, 128,
++4*16*128], wgu (decode split), wd [L, 2, 128, 4*24*128], normf, wlm (decode split), rot, cosT / sinT [128, TMAX]
+ fp32 (cosT[d, t] = cos(t * f[d % 64])), kcache, vcache (decode layouts, written in place).
+ Output: output_0 = plen [1, 1] int32 (the next decode position); toks[plen] = first generated token.
+ """
+ import nki
+ import nki.language as nl
+ import nki.isa as nisa
++from prefill_sb import _norm_sb, _xchg_add
+ from layer_decode import _consts, _rms_col, HT, HID, D, EPS
+ from step_lnc2 import _lm_argmax2
+ from nkilib.core.attention.attention_cte import _attention_cte
+@@ -193,7 +194,54 @@
+     _pa_e2(15, yb_l, rot_sb, cs, sn, qT_s, kT_s, kcache, l, pid, t0, C)
+ 
+ 
+-def _prefill(ids, plen, toks, embed, ln1, ln2, qn, kn, wqkv, wo_p, wgu, wd_p, normf, wlm, rot, cosT, sinT,
++def _post_ksplit(h, oT_s, ln2, wo_sb, wgu, wd, onesb, pid, l, S):
++    C = 512
++    wg = _load_w(wgu[l, pid], 2 * ITL * HT * 128, PWQ)
++    wd_sb = _load_w(wd[l, pid], HT * ITL * 128, PWQ)
++    w2 = nl.ndarray((128, HT), dtype=nl.float32, buffer=nl.sbuf)
++    _hd(dst=w2, src=ln2[l])
++    for c in range(S // C):
++        t0 = c * C
++        oc = nl.ndarray((128, NQL, C), dtype=nl.bfloat16, buffer=nl.sbuf)
++        for hh in range(NQL):
++            _hd(dst=oc[:, hh, :], src=oT_s[pid * NQL + hh, :, t0:t0+C])
++        hc = nl.ndarray((128, HT, C), dtype=nl.float32, buffer=nl.sbuf)
++        _hd(dst=hc, src=h[:, :, t0:t0+C])
++        part = nl.ndarray((128, HT, C), dtype=nl.float32, buffer=nl.sbuf)
++        for nt in range(HT):
++            ps = nl.ndarray((128, C), dtype=nl.float32, buffer=nl.psum)
++            for kt in range(NQL):
++                nisa.nc_matmul(dst=ps, stationary=wo_sb[:, (nt*NQL+kt)*128:(nt*NQL+kt+1)*128], moving=oc[:, kt, :])
++            nisa.tensor_copy(dst=part[:, nt, :], src=ps)
++        sc = _xchg_add(part, pid, C)
++        h2 = nl.ndarray((128, HT, C), dtype=nl.float32, buffer=nl.sbuf)
++        nisa.tensor_tensor(dst=h2, data1=hc, data2=sc, op=nl.add)
++        x2 = _norm_sb(h2, w2, onesb, C)
++        act = nl.ndarray((128, ITL, C), dtype=nl.bfloat16, buffer=nl.sbuf)
++        for i in range(ITL):
++            pg = nl.ndarray((128, C), dtype=nl.float32, buffer=nl.psum)
++            for kt in range(HT):
++                nisa.nc_matmul(dst=pg, stationary=wg[:, (i*HT+kt)*128:(i*HT+kt+1)*128], moving=x2[:, kt, :])
++            pu = nl.ndarray((128, C), dtype=nl.float32, buffer=nl.psum)
++            for kt in range(HT):
++                nisa.nc_matmul(dst=pu, stationary=wg[:, ((ITL+i)*HT+kt)*128:((ITL+i)*HT+kt+1)*128], moving=x2[:, kt, :])
++            sg = nl.ndarray((128, C), dtype=nl.float32, buffer=nl.sbuf)
++            nisa.activation(dst=sg, op=nl.silu, data=pg)
++            nisa.tensor_tensor(dst=act[:, i, :], data1=sg, data2=pu, op=nl.multiply)
++        part2 = nl.ndarray((128, HT, C), dtype=nl.float32, buffer=nl.sbuf)
++        for nt in range(HT):
++            ps = nl.ndarray((128, C), dtype=nl.float32, buffer=nl.psum)
++            for kt in range(ITL):
++                nisa.nc_matmul(dst=ps, stationary=wd_sb[:, (nt*ITL+kt)*128:(nt*ITL+kt+1)*128], moving=act[:, kt, :])
++            nisa.tensor_copy(dst=part2[:, nt, :], src=ps)
++        sd = _xchg_add(part2, pid, C)
++        h3 = nl.ndarray((128, HT, C), dtype=nl.float32, buffer=nl.sbuf)
++        nisa.tensor_tensor(dst=h3, data1=h2, data2=sd, op=nl.add)
++        _hd(dst=h[:, nl.ds(pid*4, 4), t0:t0+C], src=h3[:, nl.ds(pid*4, 4), :])
++    nisa.core_barrier(data=h, cores=(0, 1))
++
++
++def _prefill(ids, plen, toks, embed, ln1, ln2, qn, kn, wqkv, wo, wgu, wd, normf, wlm, rot, cosT, sinT,
+              kcache, vcache, sh, sq_, sk, sv, so, sa, SCR, STAGE=0):
+     """STAGE 4: phase A of one layer for the k / v tiles only (KV cache writes).
+     STAGE 0: everything; 1: embedding only; 2: the layers only (for a 1-layer NEFF run once per layer on
+@@ -267,9 +315,9 @@
+         _hd(dst=knc, src=kn[l])
+         wq = _load_w(wqkv[l, pid], 16 * HT * 128)
+         if HOIST >= S and STAGE != 4:
+-            wo_sb = _load_w(wo_p[l, pid], 4 * 16 * 128, WQ)
++            wo_sb = _load_w(wo[l, pid], 4 * 16 * 128, WQ)
+             wg = _load_w(wgu[l, pid], 2 * ITL * HT * 128, WQ)
+-            wd_sb = _load_w(wd_p[l, pid], 4 * 24 * 128, WQ)
++            wd_sb = _load_w(wd[l, pid], 4 * 24 * 128, WQ)
+         for c in range(NC):
+             t0 = c * C
+             hc = nl.ndarray((128, HT, C), dtype=nl.float32, buffer=nl.sbuf)
+@@ -378,7 +426,7 @@
+                 nisa.core_barrier(data=v_s, cores=(0, 1))
+             # ================= B: attention
+             if HOIST < S and PREF:
+-                wo_sb = _load_w(wo_p[l, pid], 4 * 16 * 128, PWQ)
++                wo_sb = _load_w(wo[l, pid], 4 * 16 * 128, PWQ)
+             if ATTN == 1 and S <= MYATTN and S <= 1024:
+                 attn_prefill_pipe(qT_s, kT_s, v_s, oT_s, pid, S)
+             elif ATTN == 1 and S <= MYATTN:
+@@ -392,72 +440,7 @@
+                     _hd(dst=tq, src=qT_s[pid * NQL + hh])
+                     _hd(dst=oT_s[pid * NQL + hh], src=tq)
+             nisa.core_barrier(data=oT_s, cores=(0, 1))
+-            # ================= C: o_proj (N-split) + residual
+-            if HOIST < S and not PREF:
+-                wo_sb = _load_w(wo_p[l, pid], 4 * 16 * 128)
+-            if HOIST < S and PREF:
+-                wg = _load_w(wgu[l, pid], 2 * ITL * HT * 128, PWQ)
+-            for c in range(NC):
+-                t0 = c * C
+-                oc = nl.ndarray((128, 16, C), dtype=nl.bfloat16, buffer=nl.sbuf)
+-                for hh in range(16):
+-                    _hd(dst=oc[:, hh, :], src=oT_s[hh, :, nl.ds(t0, C)])
+-                hc = nl.ndarray((128, 4, C), dtype=nl.float32, buffer=nl.sbuf)
+-                _hd(dst=hc, src=h[:, nl.ds(pid * 4, 4), nl.ds(t0, C)])
+-                ho = nl.ndarray((128, 4, C), dtype=nl.float32, buffer=nl.sbuf)
+-                for i in range(4):
+-                    ps = nl.ndarray((128, C), dtype=nl.float32, buffer=nl.psum)
+-                    for kt in range(16):
+-                        nisa.nc_matmul(dst=ps, stationary=wo_sb[:, (i * 16 + kt) * 128:(i * 16 + kt + 1) * 128],
+-                                       moving=oc[:, kt, :])
+-                    nisa.tensor_tensor(dst=ho[:, i, :], data1=hc[:, i, :], data2=ps, op=nl.add)
+-                _hd(dst=h[:, nl.ds(pid * 4, 4), nl.ds(t0, C)], src=ho)
+-            nisa.core_barrier(data=h, cores=(0, 1))
+-            # ================= D: norm2 + gate/up + SiLU*up
+-            w2 = nl.ndarray((128, HT), dtype=nl.float32, buffer=nl.sbuf)
+-            _hd(dst=w2, src=ln2[l])
+-            if HOIST < S and not PREF:
+-                wg = _load_w(wgu[l, pid], 2 * ITL * HT * 128)
+-            if HOIST < S and PREF:
+-                wd_sb = _load_w(wd_p[l, pid], 4 * 24 * 128, PWQ)
+-            for c in range(NC):
+-                t0 = c * C
+-                hc = nl.ndarray((128, HT, C), dtype=nl.float32, buffer=nl.sbuf)
+-                _hd(dst=hc, src=h[:, :, nl.ds(t0, C)])
+-                x2 = _norm_chunk(hc, w2, ones, C, onesb)
+-                for i in range(ITL):
+-                    pg = nl.ndarray((128, C), dtype=nl.float32, buffer=nl.psum)
+-                    for kt in range(HT):
+-                        nisa.nc_matmul(dst=pg, stationary=wg[:, (i * HT + kt) * 128:(i * HT + kt + 1) * 128], moving=x2[:, kt, :])
+-                    pu = nl.ndarray((128, C), dtype=nl.float32, buffer=nl.psum)
+-                    for kt in range(HT):
+-                        nisa.nc_matmul(dst=pu, stationary=wg[:, ((ITL + i) * HT + kt) * 128:((ITL + i) * HT + kt + 1) * 128],
+-                                       moving=x2[:, kt, :])
+-                    sg = nl.ndarray((128, C), dtype=nl.float32, buffer=nl.sbuf)
+-                    nisa.activation(dst=sg, op=nl.silu, data=pg)
+-                    ab = nl.ndarray((128, C), dtype=nl.bfloat16, buffer=nl.sbuf)
+-                    nisa.tensor_tensor(dst=ab, data1=sg, data2=pu, op=nl.multiply)
+-                    _hd(dst=act_s[pid * ITL + i, :, nl.ds(t0, C)], src=ab)
+-            nisa.core_barrier(data=act_s, cores=(0, 1))
+-            # ================= E: down (N-split) + residual
+-            if HOIST < S and not PREF:
+-                wd_sb = _load_w(wd_p[l, pid], 4 * 24 * 128)
+-            for c in range(NC):
+-                t0 = c * C
+-                ac = nl.ndarray((128, 24, C), dtype=nl.bfloat16, buffer=nl.sbuf)
+-                for i in range(24):
+-                    _hd(dst=ac[:, i, :], src=act_s[i, :, nl.ds(t0, C)])
+-                hc = nl.ndarray((128, 4, C), dtype=nl.float32, buffer=nl.sbuf)
+-                _hd(dst=hc, src=h[:, nl.ds(pid * 4, 4), nl.ds(t0, C)])
+-                ho = nl.ndarray((128, 4, C), dtype=nl.float32, buffer=nl.sbuf)
+-                for i in range(4):
+-                    ps = nl.ndarray((128, C), dtype=nl.float32, buffer=nl.psum)
+-                    for kt in range(24):
+-                        nisa.nc_matmul(dst=ps, stationary=wd_sb[:, (i * 24 + kt) * 128:(i * 24 + kt + 1) * 128],
+-                                       moving=ac[:, kt, :])
+-                    nisa.tensor_tensor(dst=ho[:, i, :], data1=hc[:, i, :], data2=ps, op=nl.add)
+-                _hd(dst=h[:, nl.ds(pid * 4, 4), nl.ds(t0, C)], src=ho)
+-            nisa.core_barrier(data=h, cores=(0, 1))
++            _post_ksplit(h, oT_s, ln2, wo_sb, wgu, wd, onesb, pid, l, S)
+ 
+     pos_out = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.shared_hbm)
+     if STAGE == 1 or STAGE == 2 or STAGE == 4:
+@@ -493,39 +476,39 @@
+ 
+ 
+ @nki.jit
+-def prefill_int(ids, plen, toks, embed, ln1, ln2, qn, kn, wqkv, wo_p, wgu, wd_p, normf, wlm, rot, cosT, sinT, kcache, vcache):
++def prefill_int(ids, plen, toks, embed, ln1, ln2, qn, kn, wqkv, wo, wgu, wd, normf, wlm, rot, cosT, sinT, kcache, vcache):
+     """variant with internal nl.shared_hbm scratch tensors: WRONG results (each core sees only its own writes)"""
+-    return _prefill(ids, plen, toks, embed, ln1, ln2, qn, kn, wqkv, wo_p, wgu, wd_p, normf, wlm, rot, cosT, sinT,
++    return _prefill(ids, plen, toks, embed, ln1, ln2, qn, kn, wqkv, wo, wgu, wd, normf, wlm, rot, cosT, sinT,
+                     kcache, vcache, None, None, None, None, None, None, 0)
+ 
+ 
+ @nki.jit
+-def prefill(ids, plen, toks, embed, ln1, ln2, qn, kn, wqkv, wo_p, wgu, wd_p, normf, wlm, rot, cosT, sinT, kcache, vcache,
++def prefill(ids, plen, toks, embed, ln1, ln2, qn, kn, wqkv, wo, wgu, wd, normf, wlm, rot, cosT, sinT, kcache, vcache,
+             s_h, s_q, s_k, s_v, s_o, s_a):
+     """scratch tensors passed in by the caller (device buffers, contents irrelevant):
+     s_h [128, 8, S] fp32, s_q [16, 128, S] bf16, s_k [8, 128, S] bf16, s_v [8, S, 128] bf16, s_o [16, 128, S] bf16,
+     s_a [24, 128, S] bf16"""
+-    return _prefill(ids, plen, toks, embed, ln1, ln2, qn, kn, wqkv, wo_p, wgu, wd_p, normf, wlm, rot, cosT, sinT,
++    return _prefill(ids, plen, toks, embed, ln1, ln2, qn, kn, wqkv, wo, wgu, wd, normf, wlm, rot, cosT, sinT,
+                     kcache, vcache, s_h, s_q, s_k, s_v, s_o, s_a, 1)
+ 
+ 
+ @nki.jit
+-def pf_emb(ids, plen, toks, embed, ln1, ln2, qn, kn, wqkv, wo_p, wgu, wd_p, normf, wlm, rot, cosT, sinT, kcache, vcache, s_h, s_q, s_k, s_v, s_o, s_a):
+-    return _prefill(ids, plen, toks, embed, ln1, ln2, qn, kn, wqkv, wo_p, wgu, wd_p, normf, wlm, rot, cosT, sinT, kcache, vcache, s_h, s_q, s_k, s_v, s_o, s_a, 1, 1)
++def pf_emb(ids, plen, toks, embed, ln1, ln2, qn, kn, wqkv, wo, wgu, wd, normf, wlm, rot, cosT, sinT, kcache, vcache, s_h, s_q, s_k, s_v, s_o, s_a):
++    return _prefill(ids, plen, toks, embed, ln1, ln2, qn, kn, wqkv, wo, wgu, wd, normf, wlm, rot, cosT, sinT, kcache, vcache, s_h, s_q, s_k, s_v, s_o, s_a, 1, 1)
+ 
+ 
+ @nki.jit
+-def pf_layer(ids, plen, toks, embed, ln1, ln2, qn, kn, wqkv, wo_p, wgu, wd_p, normf, wlm, rot, cosT, sinT, kcache, vcache, s_h, s_q, s_k, s_v, s_o, s_a):
+-    return _prefill(ids, plen, toks, embed, ln1, ln2, qn, kn, wqkv, wo_p, wgu, wd_p, normf, wlm, rot, cosT, sinT, kcache, vcache, s_h, s_q, s_k, s_v, s_o, s_a, 1, 2)
++def pf_layer(ids, plen, toks, embed, ln1, ln2, qn, kn, wqkv, wo, wgu, wd, normf, wlm, rot, cosT, sinT, kcache, vcache, s_h, s_q, s_k, s_v, s_o, s_a):
++    return _prefill(ids, plen, toks, embed, ln1, ln2, qn, kn, wqkv, wo, wgu, wd, normf, wlm, rot, cosT, sinT, kcache, vcache, s_h, s_q, s_k, s_v, s_o, s_a, 1, 2)
+ 
+ 
+ @nki.jit
+-def pf_head(ids, plen, toks, embed, ln1, ln2, qn, kn, wqkv, wo_p, wgu, wd_p, normf, wlm, rot, cosT, sinT, kcache, vcache, s_h, s_q, s_k, s_v, s_o, s_a):
+-    return _prefill(ids, plen, toks, embed, ln1, ln2, qn, kn, wqkv, wo_p, wgu, wd_p, normf, wlm, rot, cosT, sinT, kcache, vcache, s_h, s_q, s_k, s_v, s_o, s_a, 1, 3)
++def pf_head(ids, plen, toks, embed, ln1, ln2, qn, kn, wqkv, wo, wgu, wd, normf, wlm, rot, cosT, sinT, kcache, vcache, s_h, s_q, s_k, s_v, s_o, s_a):
++    return _prefill(ids, plen, toks, embed, ln1, ln2, qn, kn, wqkv, wo, wgu, wd, normf, wlm, rot, cosT, sinT, kcache, vcache, s_h, s_q, s_k, s_v, s_o, s_a, 1, 3)
+ 
+ 
+ 
+ @nki.jit
+-def pf_kv(ids, plen, toks, embed, ln1, ln2, qn, kn, wqkv, wo_p, wgu, wd_p, normf, wlm, rot, cosT, sinT, kcache, vcache, s_h, s_q, s_k, s_v, s_o, s_a):
++def pf_kv(ids, plen, toks, embed, ln1, ln2, qn, kn, wqkv, wo, wgu, wd, normf, wlm, rot, cosT, sinT, kcache, vcache, s_h, s_q, s_k, s_v, s_o, s_a):
+     """the last layer's KV cache writes (phase A, k / v tiles); the rest of that layer runs in pf_tail for the last token"""
+-    return _prefill(ids, plen, toks, embed, ln1, ln2, qn, kn, wqkv, wo_p, wgu, wd_p, normf, wlm, rot, cosT, sinT, kcache, vcache, s_h, s_q, s_k, s_v, s_o, s_a, 1, 4)
++    return _prefill(ids, plen, toks, embed, ln1, ln2, qn, kn, wqkv, wo, wgu, wd, normf, wlm, rot, cosT, sinT, kcache, vcache, s_h, s_q, s_k, s_v, s_o, s_a, 1, 4)

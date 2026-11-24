@@ -1,0 +1,102 @@
+--- a/kernels/prefill_lnc2.py
++++ b/kernels/prefill_lnc2.py
+@@ -193,6 +193,89 @@
+     _pa_e2(15, yb_l, rot_sb, cs, sn, qT_s, kT_s, kcache, l, pid, t0, C)
+ 
+ 
++def _row_m(n, items, x1, wq, ps_l):
++    qb, nt = items[n]
++    ps = nl.ndarray((128, 4, 128), dtype=nl.float32, buffer=nl.psum)
++    for kt in range(HT):
++        nisa.nc_matmul(dst=ps, stationary=x1[:, kt, qb*128:(qb+1)*128],
++                       moving=wq.ap(pattern=[[16*HT*128,128],[HT*128,4],[1,128]], offset=(nt*HT+kt)*128))
++    ps_l[n] = ps
++
++
++def _row_e(n, items, ps_l, qw, kw, cs_l, sn_l, qT_s, kT_s, v_s, kcache, vcache, l, pid, t0):
++    qb, nt = items[n]
++    pos = t0 + qb*128
++    ps = ps_l[n]
++    if nt == 12:
++        vb = nl.ndarray((128,4,128),dtype=nl.bfloat16,buffer=nl.sbuf)
++        nisa.activation(dst=vb,op=nl.copy,data=ps)
++        for j in range(4):
++            _hd(dst=v_s[pid*4+j,pos:pos+128,:],src=vb[:,j,:])
++            _hd(dst=vcache[l,pid,pos:pos+128,j*128:(j+1)*128],src=vb[:,j,:])
++        return
++    sq = nl.ndarray((128,4,128),dtype=nl.bfloat16,buffer=nl.sbuf)
++    nisa.activation(dst=sq,op=nl.square,data=ps)
++    ss = nl.ndarray((128,4,1),dtype=nl.float32,buffer=nl.sbuf)
++    nisa.tensor_reduce(dst=ss,data=sq,op=nl.add,axis=2,keepdims=True)
++    rs = nl.ndarray((128,4,1),dtype=nl.float32,buffer=nl.sbuf)
++    nisa.activation(dst=rs,op=nl.rsqrt,data=ss,scale=1.0/128,bias=EPS)
++    gain=qw
++    if nt==8:
++        gain=kw
++    y0 = nl.ndarray((128,4,128),dtype=nl.float32,buffer=nl.sbuf)
++    nisa.tensor_tensor(dst=y0,data1=ps,data2=gain.ap(pattern=[[128,128],[0,4],[1,128]],offset=0),op=nl.multiply)
++    yb = nl.ndarray((128,4,128),dtype=nl.bfloat16,buffer=nl.sbuf)
++    nisa.tensor_tensor(dst=yb,data1=y0,data2=rs.ap(pattern=[[4,128],[1,4],[0,128]],offset=0),op=nl.multiply)
++    xc = nl.ndarray((128,4,128),dtype=nl.float32,buffer=nl.sbuf)
++    xs = nl.ndarray((128,4,128),dtype=nl.float32,buffer=nl.sbuf)
++    nisa.tensor_tensor(dst=xc,data1=yb,data2=cs_l[qb].ap(pattern=[[128,128],[0,4],[1,128]],offset=0),op=nl.multiply)
++    nisa.tensor_tensor(dst=xs[:,:,0:64],data1=yb[:,:,64:128],
++                       data2=sn_l[qb].ap(pattern=[[128,128],[0,4],[1,64]],offset=0),op=nl.multiply)
++    nisa.tensor_tensor(dst=xs[:,:,64:128],data1=yb[:,:,0:64],
++                       data2=sn_l[qb].ap(pattern=[[128,128],[0,4],[1,64]],offset=64),op=nl.multiply)
++    ro = nl.ndarray((128,4,128),dtype=nl.bfloat16,buffer=nl.sbuf)
++    nisa.tensor_tensor(dst=ro,data1=xc,data2=xs,op=nl.add,engine=nisa.engine.gpsimd)
++    rt = nl.ndarray((128,4,128),dtype=nl.bfloat16,buffer=nl.sbuf)
++    nisa.dma_transpose(dst=rt,src=ro)
++    for j in range(4):
++        if nt<8:
++            _hd(dst=qT_s[pid*8+nt+j,:,pos:pos+128],src=rt[:,j,:])
++        else:
++            _hd(dst=kT_s[pid*4+j,:,pos:pos+128],src=rt[:,j,:])
++            _hd(dst=kcache[l,pid,j,:,pos:pos+128],src=rt[:,j,:])
++
++
++def _phase_a_row(x1,wq,qn,kn,cosT,sinT,qT_s,kT_s,v_s,kcache,vcache,l,pid,t0,C,NT0):
++    qw = nl.ndarray((128,128),dtype=nl.float32,buffer=nl.sbuf)
++    kw = nl.ndarray((128,128),dtype=nl.float32,buffer=nl.sbuf)
++    _hd(dst=qw,src=qn[l].ap(pattern=[[0,128],[1,128]],offset=0))
++    _hd(dst=kw,src=kn[l].ap(pattern=[[0,128],[1,128]],offset=0))
++    cs_l=[]
++    sn_l=[]
++    TMAX=cosT.shape[1]
++    for qb in range(C//128):
++        cs=nl.ndarray((128,128),dtype=nl.float32,buffer=nl.sbuf)
++        sn=nl.ndarray((128,128),dtype=nl.float32,buffer=nl.sbuf)
++        _hd(dst=cs,src=cosT.ap(pattern=[[1,128],[TMAX,128]],offset=t0+qb*128))
++        _hd(dst=sn,src=sinT.ap(pattern=[[1,128],[TMAX,128]],offset=t0+qb*128))
++        nisa.tensor_scalar(dst=sn[:,0:64],data=sn[:,0:64],op0=nl.multiply,operand0=-1.0)
++        cs_l.append(cs)
++        sn_l.append(sn)
++    items=[]
++    ps_l=[]
++    for qb in range(C//128):
++        for nt in range(NT0,16,4):
++            items.append((qb,nt))
++            ps_l.append(0)
++    N=len(items)
++    for n in range(2):
++        _row_m(n,items,x1,wq,ps_l)
++    for n in range(N):
++        if n+2<N:
++            _row_m(n+2,items,x1,wq,ps_l)
++        _row_e(n,items,ps_l,qw,kw,cs_l,sn_l,qT_s,kT_s,v_s,kcache,vcache,l,pid,t0)
++
++
+ def _prefill(ids, plen, toks, embed, ln1, ln2, qn, kn, wqkv, wo_p, wgu, wd_p, normf, wlm, rot, cosT, sinT,
+              kcache, vcache, sh, sq_, sk, sv, so, sa, SCR, STAGE=0):
+     """STAGE 4: phase A of one layer for the k / v tiles only (KV cache writes).
+@@ -282,6 +365,9 @@
+             _hd(dst=cs, src=cosT[:, nl.ds(t0, C)])
+             sn = nl.ndarray((128, C), dtype=nl.float32, buffer=nl.sbuf)
+             _hd(dst=sn, src=sinT[:, nl.ds(t0, C)])
++            if S == 4096 and STAGE == 2:
++                _phase_a_row(x1,wq,qn,kn,cosT,sinT,qT_s,kT_s,v_s,kcache,vcache,l,pid,t0,C,NT0)
++                continue
+             if APIPE and S >= APIPE:
+                 _phase_a_pipe(x1, wq, onesb, rot_sb, ident, qnc, knc, cs, sn, qT_s, kT_s, v_s, kcache, vcache,
+                               l, pid, t0, C, NT0)

@@ -1,0 +1,60 @@
+--- a/kernels/attn_prefill.py
++++ b/kernels/attn_prefill.py
+@@ -157,12 +157,15 @@
+     # Mask the diagonal block, then store z = -SCALE * scores while reducing min(z).
+     # exp(-z + min(z)) needs no separate row-maximum scaling instruction.
+     nisa.tensor_tensor(dst=ps[:, i * 128:K], data1=ps[:, i * 128:K], data2=msk, op=nl.add)
++    scaled = ps
++    if NB == 8:
++        scaled = nl.ndarray((128, K), dtype=nl.float32, buffer=nl.sbuf)
+     nm = nl.ndarray((128, 1), dtype=nl.float32, buffer=nl.sbuf)
+-    nisa.tensor_scalar_reduce(dst=ps[:, 0:K], data=ps[:, 0:K], op0=nl.multiply, operand0=-SCALE,
++    nisa.tensor_scalar_reduce(dst=scaled[:, 0:K], data=ps[:, 0:K], op0=nl.multiply, operand0=-SCALE,
+                               reduce_op=nl.minimum, reduce_res=nm)
+     e = nl.ndarray((128, K), dtype=nl.bfloat16, buffer=nl.sbuf)
+     sm = nl.ndarray((128, 1), dtype=nl.float32, buffer=nl.sbuf)
+-    nisa.activation_reduce(dst=e, op=nl.exp, data=ps[:, 0:K], reduce_op=nl.add, reduce_res=sm, bias=nm, scale=-1.0)
++    nisa.activation_reduce(dst=e, op=nl.exp, data=scaled[:, 0:K], reduce_op=nl.add, reduce_res=sm, bias=nm, scale=-1.0)
+     pi = n // 2
+     if hh == 0:
+         rinv_l[pi] = nl.ndarray((128, 2), dtype=nl.float32, buffer=nl.sbuf)
+@@ -180,15 +183,18 @@
+     # Mask the diagonal block, then store z = -SCALE * scores while reducing min(z).
+     # exp(-z + min(z)) needs no separate row-maximum scaling instruction.
+     nisa.tensor_tensor(dst=ps[:, i * 128:K], data1=ps[:, i * 128:K], data2=msk, op=nl.add)
++    scaled = ps
++    if NB == 8:
++        scaled = nl.ndarray((128, K), dtype=nl.float32, buffer=nl.sbuf)
+     nm = nl.ndarray((128, 1), dtype=nl.float32, buffer=nl.sbuf)
+-    nisa.tensor_scalar_reduce(dst=ps[:, 0:K], data=ps[:, 0:K], op0=nl.multiply, operand0=-SCALE,
++    nisa.tensor_scalar_reduce(dst=scaled[:, 0:K], data=ps[:, 0:K], op0=nl.multiply, operand0=-SCALE,
+                               reduce_op=nl.minimum, reduce_res=nm)
+     pi = n // 2
+     if hh == 0:
+         rinv_l[pi] = nl.ndarray((128, 2), dtype=nl.float32, buffer=nl.sbuf)
+         eT_l[pi] = nl.ndarray((128, NB, 256), dtype=nl.bfloat16, buffer=nl.sbuf)
+     e = nl.ndarray((128, K), dtype=nl.bfloat16, buffer=nl.sbuf)
+-    nisa.activation_reduce(dst=e, op=nl.exp, data=ps[:, 0:K], reduce_op=nl.add,
++    nisa.activation_reduce(dst=e, op=nl.exp, data=scaled[:, 0:K], reduce_op=nl.add,
+                            reduce_res=rinv_l[pi][:, hh:hh + 1], bias=nm, scale=-1.0)
+     e_l[n] = e
+ 
+@@ -429,6 +435,18 @@
+     for n in range(N // 2):
+         rinv_l.append(0)
+         eT_l.append(0)
++    if S == 1024:
++        for n in range(N + 3):
++            if n < N:
++                _ap_s1(n, items, qts, kts, ps_l)
++            m2 = n - 1
++            if m2 >= 0 and m2 < N:
++                _ap_s2_late(m2, items, msk, ps_l, e_l, rinv_l, eT_l, NB)
++                _ap_transpose(m2, items, e_l, eT_l, NB)
++            m3 = n - 3
++            if m3 >= 0:
++                _ap_pv(m3, items, rinv_l, eT_l, vts, idf, ones, 0, 0, NB, osb, True)
++        return
+     for n in range(DEPTH):
+         _ap_s1(n, items, qts, kts, ps_l)
+     _ap_s2(0, items, msk, ps_l, e_l, rinv_l, eT_l, NB)

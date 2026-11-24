@@ -1,0 +1,21 @@
+--- a/kernels/attn_prefill.py
++++ b/kernels/attn_prefill.py
+@@ -429,6 +429,18 @@
+     for n in range(N // 2):
+         rinv_l.append(0)
+         eT_l.append(0)
++    if S == 1024:
++        for n in range(N + 3):
++            if n < N:
++                _ap_s1(n, items, qts, kts, ps_l)
++            m2 = n - 1
++            if m2 >= 0 and m2 < N:
++                _ap_s2(m2, items, msk, ps_l, e_l, rinv_l, eT_l, NB)
++                _ap_transpose(m2, items, e_l, eT_l, NB)
++            m3 = n - 3
++            if m3 >= 0:
++                _ap_pv(m3, items, rinv_l, eT_l, vts, idf, ones, 0, 0, NB, osb, False)
++        return
+     for n in range(DEPTH):
+         _ap_s1(n, items, qts, kts, ps_l)
+     _ap_s2(0, items, msk, ps_l, e_l, rinv_l, eT_l, NB)

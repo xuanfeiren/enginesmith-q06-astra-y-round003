@@ -1,0 +1,403 @@
+--- a/kernels/prefill_lnc2.py
++++ b/kernels/prefill_lnc2.py
+@@ -42,7 +42,18 @@
+ NOBAR = int(_os.environ.get('PF_NOBAR', '0'))   # 1: no barrier before attn_prefill (measured: no gain)
+ HOIST = int(_os.environ.get('PF_HOIST', '256'))   # buckets up to this size load all of a layer's weights at its top
+ LMHW = int(_os.environ.get('PF_LMHW', '2'))     # LM head weight stream: 2 = sync HWDGE queue, 0 = default
++DPIPE = int(_os.environ.get('PF_DPIPE', '0'))
++CHUNK = int(_os.environ.get('PF_CHUNK', '512'))
++POSTCHUNK = int(_os.environ.get('PF_POSTCHUNK', '0'))
++ROPE_SHUFFLE = int(_os.environ.get('PF_ROPE_SHUFFLE', '0'))
++VDMA = int(_os.environ.get('PF_VDMA', '0'))
+ MYATTN = int(_os.environ.get('PF_MYATTN', '4096'))  # prompt buckets up to this size use attn_prefill.py
++
++
++def _mm(dst, stationary, moving):
++    for c0 in range(0, moving.shape[1], 512):
++        c1 = min(c0 + 512, moving.shape[1])
++        nisa.nc_matmul(dst=dst[:, c0:c1], stationary=stationary, moving=moving[:, c0:c1])
+ 
+ 
+ def _norm_chunk(hc, w_sb, ones, C, onesb=None):
+@@ -53,13 +64,13 @@
+         nisa.tensor_tensor(dst=sq, data1=hc, data2=hc, op=nl.multiply)
+         ss = nl.ndarray((128, C), dtype=nl.float32, buffer=nl.psum)
+         for kt in range(HT):
+-            nisa.nc_matmul(dst=ss, stationary=ones, moving=sq[:, kt, :])
++            _mm(dst=ss, stationary=ones, moving=sq[:, kt, :])
+     else:
+         sq = nl.ndarray((128, HT, C), dtype=nl.bfloat16, buffer=nl.sbuf)
+         nisa.activation(dst=sq, op=nl.square, data=hc)
+         ss = nl.ndarray((128, C), dtype=nl.float32, buffer=nl.psum)
+         for kt in range(HT):
+-            nisa.nc_matmul(dst=ss, stationary=onesb, moving=sq[:, kt, :])
++            _mm(dst=ss, stationary=onesb, moving=sq[:, kt, :])
+     rstd = nl.ndarray((128, C), dtype=nl.float32, buffer=nl.sbuf)
+     if XG and FUSE:   # rsqrt(ss / n + eps) in one ScalarE instruction (PSUM in)
+         nisa.activation(dst=rstd, op=nl.rsqrt, data=ss, scale=1.0 / HID, bias=EPS)
+@@ -112,7 +123,7 @@
+ def _pa_m(nt, x1, wq, C, ps_l):
+     ps = nl.ndarray((128, C), dtype=nl.float32, buffer=nl.psum)
+     for kt in range(HT):
+-        nisa.nc_matmul(dst=ps, stationary=wq[:, (nt * HT + kt) * 128:(nt * HT + kt + 1) * 128], moving=x1[:, kt, :])
++        _mm(dst=ps, stationary=wq[:, (nt * HT + kt) * 128:(nt * HT + kt + 1) * 128], moving=x1[:, kt, :])
+     ps_l[nt] = ps
+ 
+ 
+@@ -122,7 +133,7 @@
+         sq = nl.ndarray((128, C), dtype=nl.bfloat16, buffer=nl.sbuf)
+         nisa.activation(dst=sq, op=nl.square, data=ps)
+         ss = nl.ndarray((128, C), dtype=nl.float32, buffer=nl.psum)
+-        nisa.nc_matmul(dst=ss, stationary=onesb, moving=sq)
++        _mm(dst=ss, stationary=onesb, moving=sq)
+         rs = nl.ndarray((128, C), dtype=nl.float32, buffer=nl.sbuf)
+         if XG and FUSE:   # rsqrt(ss / n + eps) in one ScalarE instruction (PSUM in)
+             nisa.activation(dst=rs, op=nl.rsqrt, data=ss, scale=1.0 / D, bias=EPS)
+@@ -143,10 +154,13 @@
+         vb = nl.ndarray((128, C), dtype=nl.bfloat16, buffer=nl.sbuf)
+         nisa.activation(dst=vb, op=nl.copy, data=ps)
+         vr = nl.ndarray((128, C // 128, D), dtype=nl.bfloat16, buffer=nl.sbuf)
+-        for tb in range(C // 128):
+-            tp = nl.ndarray((128, D), dtype=nl.float32, buffer=nl.psum)
+-            nisa.nc_matmul(dst=tp, stationary=vb[:, tb * 128:(tb + 1) * 128], moving=ident)
+-            nisa.tensor_copy(dst=vr[:, tb, :], src=tp)
++        if VDMA:
++            nisa.dma_transpose(dst=vr, src=vb.reshape((128, C // 128, 128)))
++        else:
++            for tb in range(C // 128):
++                tp = nl.ndarray((128, D), dtype=nl.float32, buffer=nl.psum)
++                _mm(dst=tp, stationary=vb[:, tb * 128:(tb + 1) * 128], moving=ident)
++                nisa.tensor_copy(dst=vr[:, tb, :], src=tp)
+         for tb in range(C // 128):
+             _hd(dst=v_s[pid * NKL + j, nl.ds(t0 + tb * 128, 128), :], src=vr[:, tb, :])
+             _hd(dst=vcache[l, pid, nl.ds(t0 + tb * 128, 128), j * D:(j + 1) * D], src=vr[:, tb, :])
+@@ -156,8 +170,17 @@
+     if nt >= NQL + NKL:
+         return
+     yb = yb_l[nt]
+-    rp = nl.ndarray((128, C), dtype=nl.float32, buffer=nl.psum)
+-    nisa.nc_matmul(dst=rp, stationary=rot_sb, moving=yb)
++    if ROPE_SHUFFLE:
++        swap = nl.ndarray((128, C), dtype=nl.bfloat16, buffer=nl.sbuf)
++        mask = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]
++        nisa.nc_stream_shuffle(dst=swap[0:64, :], src=yb[64:128, :], shuffle_mask=mask)
++        nisa.nc_stream_shuffle(dst=swap[64:128, :], src=yb[0:64, :], shuffle_mask=mask)
++        rp = nl.ndarray((128, C), dtype=nl.float32, buffer=nl.sbuf)
++        nisa.activation(dst=rp[0:64, :], op=nl.copy, data=swap[0:64, :], scale=-1.0)
++        nisa.activation(dst=rp[64:128, :], op=nl.copy, data=swap[64:128, :])
++    else:
++        rp = nl.ndarray((128, C), dtype=nl.float32, buffer=nl.psum)
++        _mm(dst=rp, stationary=rot_sb, moving=yb)
+     xc = nl.ndarray((128, C), dtype=nl.float32, buffer=nl.sbuf)
+     nisa.tensor_tensor(dst=xc, data1=yb, data2=cs, op=nl.multiply)
+     xs = nl.ndarray((128, C), dtype=nl.float32, buffer=nl.sbuf)
+@@ -193,6 +216,91 @@
+     _pa_e2(15, yb_l, rot_sb, cs, sn, qT_s, kT_s, kcache, l, pid, t0, C)
+ 
+ 
++def _pd_m(i, x2, wg, C, pgs, pus):
++    pg = nl.ndarray((128, C), dtype=nl.float32, buffer=nl.psum)
++    for kt in range(HT):
++        _mm(dst=pg, stationary=wg[:, (i * HT + kt) * 128:(i * HT + kt + 1) * 128], moving=x2[:, kt, :])
++    pu = nl.ndarray((128, C), dtype=nl.float32, buffer=nl.psum)
++    for kt in range(HT):
++        _mm(dst=pu, stationary=wg[:, ((ITL + i) * HT + kt) * 128:((ITL + i) * HT + kt + 1) * 128], moving=x2[:, kt, :])
++    pgs[i] = pg
++    pus[i] = pu
++
++
++def _phase_d_pipe(x2, wg, act_s, pid, t0, C):
++    pgs = []
++    pus = []
++    for i in range(ITL):
++        pgs.append(0)
++        pus.append(0)
++    for i in range(DPIPE):
++        _pd_m(i, x2, wg, C, pgs, pus)
++    for i in range(ITL):
++        if i + DPIPE < ITL:
++            _pd_m(i + DPIPE, x2, wg, C, pgs, pus)
++        sg = nl.ndarray((128, C), dtype=nl.float32, buffer=nl.sbuf)
++        nisa.activation(dst=sg, op=nl.silu, data=pgs[i])
++        ab = nl.ndarray((128, C), dtype=nl.bfloat16, buffer=nl.sbuf)
++        nisa.tensor_tensor(dst=ab, data1=sg, data2=pus[i], op=nl.multiply)
++        _hd(dst=act_s[pid * ITL + i, :, nl.ds(t0, C)], src=ab)
++
++
++def _post_chunk(h, oT_s, ln2, wo_sb, wgu, wd_p, ones, onesb, pid, l, S, C):
++    """Original N-split projections, chunk-local intermediate activations exchanged through SBUF."""
++    wg = _load_w(wgu[l, pid], 2 * ITL * HT * 128, PWQ)
++    wd_sb = _load_w(wd_p[l, pid], 4 * 24 * 128, PWQ)
++    w2 = nl.ndarray((128, HT), dtype=nl.float32, buffer=nl.sbuf)
++    _hd(dst=w2, src=ln2[l])
++    for c in range(S // C):
++        t0 = c * C
++        oc = nl.ndarray((128, 16, C), dtype=nl.bfloat16, buffer=nl.sbuf)
++        for hh in range(16):
++            _hd(dst=oc[:, hh, :], src=oT_s[hh, :, nl.ds(t0, C)])
++        hc = nl.ndarray((128, 4, C), dtype=nl.float32, buffer=nl.sbuf)
++        _hd(dst=hc, src=h[:, nl.ds(pid * 4, 4), nl.ds(t0, C)])
++        ho = nl.ndarray((128, 4, C), dtype=nl.float32, buffer=nl.sbuf)
++        for i in range(4):
++            ps = nl.ndarray((128, C), dtype=nl.float32, buffer=nl.psum)
++            for kt in range(16):
++                _mm(dst=ps, stationary=wo_sb[:, (i * 16 + kt) * 128:(i * 16 + kt + 1) * 128],
++                               moving=oc[:, kt, :])
++            nisa.tensor_tensor(dst=ho[:, i, :], data1=hc[:, i, :], data2=ps, op=nl.add)
++        other = nl.ndarray((128, 4, C), dtype=nl.float32, buffer=nl.sbuf)
++        nisa.sendrecv(src=ho, dst=other, send_to_rank=1-pid, recv_from_rank=1-pid, pipe_id=0,
++                      dma_engine=nisa.dma_engine.dma)
++        h2 = nl.ndarray((128, HT, C), dtype=nl.float32, buffer=nl.sbuf)
++        nisa.tensor_copy(dst=h2[:, nl.ds(pid * 4, 4), :], src=ho)
++        nisa.tensor_copy(dst=h2[:, nl.ds((1-pid) * 4, 4), :], src=other)
++        x2 = _norm_chunk(h2, w2, ones, C, onesb)
++        local_a = nl.ndarray((128, ITL, C), dtype=nl.bfloat16, buffer=nl.sbuf)
++        for i in range(ITL):
++            pg = nl.ndarray((128, C), dtype=nl.float32, buffer=nl.psum)
++            for kt in range(HT):
++                _mm(dst=pg, stationary=wg[:, (i * HT + kt) * 128:(i * HT + kt + 1) * 128], moving=x2[:, kt, :])
++            pu = nl.ndarray((128, C), dtype=nl.float32, buffer=nl.psum)
++            for kt in range(HT):
++                _mm(dst=pu, stationary=wg[:, ((ITL + i) * HT + kt) * 128:((ITL + i) * HT + kt + 1) * 128],
++                               moving=x2[:, kt, :])
++            sg = nl.ndarray((128, C), dtype=nl.float32, buffer=nl.sbuf)
++            nisa.activation(dst=sg, op=nl.silu, data=pg)
++            nisa.tensor_tensor(dst=local_a[:, i, :], data1=sg, data2=pu, op=nl.multiply)
++        other_a = nl.ndarray((128, ITL, C), dtype=nl.bfloat16, buffer=nl.sbuf)
++        nisa.sendrecv(src=local_a, dst=other_a, send_to_rank=1-pid, recv_from_rank=1-pid, pipe_id=1,
++                      dma_engine=nisa.dma_engine.dma)
++        ac = nl.ndarray((128, 24, C), dtype=nl.bfloat16, buffer=nl.sbuf)
++        nisa.tensor_copy(dst=ac[:, nl.ds(pid * ITL, ITL), :], src=local_a)
++        nisa.tensor_copy(dst=ac[:, nl.ds((1-pid) * ITL, ITL), :], src=other_a)
++        hout = nl.ndarray((128, 4, C), dtype=nl.float32, buffer=nl.sbuf)
++        for i in range(4):
++            ps = nl.ndarray((128, C), dtype=nl.float32, buffer=nl.psum)
++            for kt in range(24):
++                _mm(dst=ps, stationary=wd_sb[:, (i * 24 + kt) * 128:(i * 24 + kt + 1) * 128],
++                               moving=ac[:, kt, :])
++            nisa.tensor_tensor(dst=hout[:, i, :], data1=ho[:, i, :], data2=ps, op=nl.add)
++        _hd(dst=h[:, nl.ds(pid * 4, 4), nl.ds(t0, C)], src=hout)
++    nisa.core_barrier(data=h, cores=(0, 1))
++
++
+ def _prefill(ids, plen, toks, embed, ln1, ln2, qn, kn, wqkv, wo_p, wgu, wd_p, normf, wlm, rot, cosT, sinT,
+              kcache, vcache, sh, sq_, sk, sv, so, sa, SCR, STAGE=0):
+     """STAGE 4: phase A of one layer for the k / v tiles only (KV cache writes).
+@@ -201,8 +309,8 @@
+     S = ids.shape[0]
+     L = wqkv.shape[0]
+     pid = nl.program_id(0)
+-    C = 512
+-    if S < 512:
++    C = CHUNK
++    if S < CHUNK:
+         C = S
+     NC = S // C
+     NB = S // 128
+@@ -250,7 +358,7 @@
+         et = nl.ndarray((128, HT, 128), dtype=nl.float32, buffer=nl.sbuf)
+         for kt in range(HT):
+             tp = nl.ndarray((128, 128), dtype=nl.float32, buffer=nl.psum)
+-            nisa.nc_matmul(dst=tp, stationary=er[:, kt * 128:(kt + 1) * 128], moving=ident)
++            _mm(dst=tp, stationary=er[:, kt * 128:(kt + 1) * 128], moving=ident)
+             nisa.tensor_copy(dst=et[:, kt, :], src=tp)
+         nisa.dma_copy(dst=h[:, :, nl.ds(b * 128, 128)], src=et)
+     if NB > 0:
+@@ -291,14 +399,14 @@
+             for nt in range(NT0, 16 * continue_tiles):
+                 ps = nl.ndarray((128, C), dtype=nl.float32, buffer=nl.psum)
+                 for kt in range(HT):
+-                    nisa.nc_matmul(dst=ps, stationary=wq[:, (nt * HT + kt) * 128:(nt * HT + kt + 1) * 128],
++                    _mm(dst=ps, stationary=wq[:, (nt * HT + kt) * 128:(nt * HT + kt + 1) * 128],
+                                    moving=x1[:, kt, :])
+                 if nt < NQL + NKL:
+                     if FAST:
+                         sq = nl.ndarray((128, C), dtype=nl.bfloat16, buffer=nl.sbuf)
+                         nisa.activation(dst=sq, op=nl.square, data=ps)
+                         ss = nl.ndarray((128, C), dtype=nl.float32, buffer=nl.psum)
+-                        nisa.nc_matmul(dst=ss, stationary=onesb, moving=sq)
++                        _mm(dst=ss, stationary=onesb, moving=sq)
+                         rs = nl.ndarray((128, C), dtype=nl.float32, buffer=nl.sbuf)
+                         if XG and FUSE:   # rsqrt(ss / n + eps) in one ScalarE instruction (PSUM in)
+                             nisa.activation(dst=rs, op=nl.rsqrt, data=ss, scale=1.0 / D, bias=EPS)
+@@ -314,7 +422,7 @@
+                         else:
+                             nisa.scalar_tensor_tensor(dst=yb, data=ps, op0=nl.multiply, operand0=knc, op1=nl.multiply, operand1=rs)
+                         rp = nl.ndarray((128, C), dtype=nl.float32, buffer=nl.psum)
+-                        nisa.nc_matmul(dst=rp, stationary=rot_sb, moving=yb)
++                        _mm(dst=rp, stationary=rot_sb, moving=yb)
+                         xc = nl.ndarray((128, C), dtype=nl.float32, buffer=nl.sbuf)
+                         nisa.tensor_tensor(dst=xc, data1=yb, data2=cs, op=nl.multiply)
+                         xs = nl.ndarray((128, C), dtype=nl.float32, buffer=nl.sbuf)
+@@ -330,7 +438,7 @@
+                         sq = nl.ndarray((128, C), dtype=nl.float32, buffer=nl.sbuf)
+                         nisa.tensor_tensor(dst=sq, data1=y, data2=y, op=nl.multiply)
+                         ss = nl.ndarray((128, C), dtype=nl.float32, buffer=nl.psum)
+-                        nisa.nc_matmul(dst=ss, stationary=ones, moving=sq)
++                        _mm(dst=ss, stationary=ones, moving=sq)
+                         rs = nl.ndarray((128, C), dtype=nl.float32, buffer=nl.sbuf)
+                         nisa.tensor_scalar(dst=rs, data=ss, op0=nl.multiply, operand0=1.0 / D, op1=nl.add, operand1=EPS)
+                         nisa.tensor_scalar(dst=rs, data=rs, op0=nl.rsqrt, operand0=0.0, engine=nisa.engine.gpsimd)
+@@ -342,7 +450,7 @@
+                         else:
+                             nisa.tensor_scalar(dst=yb, data=yn, op0=nl.multiply, operand0=knc)
+                         rp = nl.ndarray((128, C), dtype=nl.float32, buffer=nl.psum)
+-                        nisa.nc_matmul(dst=rp, stationary=rot_sb, moving=yb)
++                        _mm(dst=rp, stationary=rot_sb, moving=yb)
+                         xc = nl.ndarray((128, C), dtype=nl.float32, buffer=nl.sbuf)
+                         nisa.tensor_tensor(dst=xc, data1=yb, data2=cs, op=nl.multiply)
+                         xs = nl.ndarray((128, C), dtype=nl.float32, buffer=nl.sbuf)
+@@ -365,7 +473,7 @@
+                     vr = nl.ndarray((128, C // 128, D), dtype=nl.bfloat16, buffer=nl.sbuf)
+                     for tb in range(C // 128):
+                         tp = nl.ndarray((128, D), dtype=nl.float32, buffer=nl.psum)
+-                        nisa.nc_matmul(dst=tp, stationary=vb[:, tb * 128:(tb + 1) * 128], moving=ident)
++                        _mm(dst=tp, stationary=vb[:, tb * 128:(tb + 1) * 128], moving=ident)
+                         nisa.tensor_copy(dst=vr[:, tb, :], src=tp)
+                     for tb in range(C // 128):
+                         _hd(dst=v_s[pid * NKL + j, nl.ds(t0 + tb * 128, 128), :], src=vr[:, tb, :])
+@@ -392,72 +500,78 @@
+                     _hd(dst=tq, src=qT_s[pid * NQL + hh])
+                     _hd(dst=oT_s[pid * NQL + hh], src=tq)
+             nisa.core_barrier(data=oT_s, cores=(0, 1))
+-            # ================= C: o_proj (N-split) + residual
+-            if HOIST < S and not PREF:
+-                wo_sb = _load_w(wo_p[l, pid], 4 * 16 * 128)
+-            if HOIST < S and PREF:
+-                wg = _load_w(wgu[l, pid], 2 * ITL * HT * 128, PWQ)
+-            for c in range(NC):
+-                t0 = c * C
+-                oc = nl.ndarray((128, 16, C), dtype=nl.bfloat16, buffer=nl.sbuf)
+-                for hh in range(16):
+-                    _hd(dst=oc[:, hh, :], src=oT_s[hh, :, nl.ds(t0, C)])
+-                hc = nl.ndarray((128, 4, C), dtype=nl.float32, buffer=nl.sbuf)
+-                _hd(dst=hc, src=h[:, nl.ds(pid * 4, 4), nl.ds(t0, C)])
+-                ho = nl.ndarray((128, 4, C), dtype=nl.float32, buffer=nl.sbuf)
+-                for i in range(4):
+-                    ps = nl.ndarray((128, C), dtype=nl.float32, buffer=nl.psum)
+-                    for kt in range(16):
+-                        nisa.nc_matmul(dst=ps, stationary=wo_sb[:, (i * 16 + kt) * 128:(i * 16 + kt + 1) * 128],
+-                                       moving=oc[:, kt, :])
+-                    nisa.tensor_tensor(dst=ho[:, i, :], data1=hc[:, i, :], data2=ps, op=nl.add)
+-                _hd(dst=h[:, nl.ds(pid * 4, 4), nl.ds(t0, C)], src=ho)
+-            nisa.core_barrier(data=h, cores=(0, 1))
+-            # ================= D: norm2 + gate/up + SiLU*up
+-            w2 = nl.ndarray((128, HT), dtype=nl.float32, buffer=nl.sbuf)
+-            _hd(dst=w2, src=ln2[l])
+-            if HOIST < S and not PREF:
+-                wg = _load_w(wgu[l, pid], 2 * ITL * HT * 128)
+-            if HOIST < S and PREF:
+-                wd_sb = _load_w(wd_p[l, pid], 4 * 24 * 128, PWQ)
+-            for c in range(NC):
+-                t0 = c * C
+-                hc = nl.ndarray((128, HT, C), dtype=nl.float32, buffer=nl.sbuf)
+-                _hd(dst=hc, src=h[:, :, nl.ds(t0, C)])
+-                x2 = _norm_chunk(hc, w2, ones, C, onesb)
+-                for i in range(ITL):
+-                    pg = nl.ndarray((128, C), dtype=nl.float32, buffer=nl.psum)
+-                    for kt in range(HT):
+-                        nisa.nc_matmul(dst=pg, stationary=wg[:, (i * HT + kt) * 128:(i * HT + kt + 1) * 128], moving=x2[:, kt, :])
+-                    pu = nl.ndarray((128, C), dtype=nl.float32, buffer=nl.psum)
+-                    for kt in range(HT):
+-                        nisa.nc_matmul(dst=pu, stationary=wg[:, ((ITL + i) * HT + kt) * 128:((ITL + i) * HT + kt + 1) * 128],
+-                                       moving=x2[:, kt, :])
+-                    sg = nl.ndarray((128, C), dtype=nl.float32, buffer=nl.sbuf)
+-                    nisa.activation(dst=sg, op=nl.silu, data=pg)
+-                    ab = nl.ndarray((128, C), dtype=nl.bfloat16, buffer=nl.sbuf)
+-                    nisa.tensor_tensor(dst=ab, data1=sg, data2=pu, op=nl.multiply)
+-                    _hd(dst=act_s[pid * ITL + i, :, nl.ds(t0, C)], src=ab)
+-            nisa.core_barrier(data=act_s, cores=(0, 1))
+-            # ================= E: down (N-split) + residual
+-            if HOIST < S and not PREF:
+-                wd_sb = _load_w(wd_p[l, pid], 4 * 24 * 128)
+-            for c in range(NC):
+-                t0 = c * C
+-                ac = nl.ndarray((128, 24, C), dtype=nl.bfloat16, buffer=nl.sbuf)
+-                for i in range(24):
+-                    _hd(dst=ac[:, i, :], src=act_s[i, :, nl.ds(t0, C)])
+-                hc = nl.ndarray((128, 4, C), dtype=nl.float32, buffer=nl.sbuf)
+-                _hd(dst=hc, src=h[:, nl.ds(pid * 4, 4), nl.ds(t0, C)])
+-                ho = nl.ndarray((128, 4, C), dtype=nl.float32, buffer=nl.sbuf)
+-                for i in range(4):
+-                    ps = nl.ndarray((128, C), dtype=nl.float32, buffer=nl.psum)
+-                    for kt in range(24):
+-                        nisa.nc_matmul(dst=ps, stationary=wd_sb[:, (i * 24 + kt) * 128:(i * 24 + kt + 1) * 128],
+-                                       moving=ac[:, kt, :])
+-                    nisa.tensor_tensor(dst=ho[:, i, :], data1=hc[:, i, :], data2=ps, op=nl.add)
+-                _hd(dst=h[:, nl.ds(pid * 4, 4), nl.ds(t0, C)], src=ho)
+-            nisa.core_barrier(data=h, cores=(0, 1))
++            if POSTCHUNK:
++                _post_chunk(h, oT_s, ln2, wo_sb, wgu, wd_p, ones, onesb, pid, l, S, POSTCHUNK)
++            else:
++                # ================= C: o_proj (N-split) + residual
++                if HOIST < S and not PREF:
++                    wo_sb = _load_w(wo_p[l, pid], 4 * 16 * 128)
++                if HOIST < S and PREF:
++                    wg = _load_w(wgu[l, pid], 2 * ITL * HT * 128, PWQ)
++                for c in range(NC):
++                    t0 = c * C
++                    oc = nl.ndarray((128, 16, C), dtype=nl.bfloat16, buffer=nl.sbuf)
++                    for hh in range(16):
++                        _hd(dst=oc[:, hh, :], src=oT_s[hh, :, nl.ds(t0, C)])
++                    hc = nl.ndarray((128, 4, C), dtype=nl.float32, buffer=nl.sbuf)
++                    _hd(dst=hc, src=h[:, nl.ds(pid * 4, 4), nl.ds(t0, C)])
++                    ho = nl.ndarray((128, 4, C), dtype=nl.float32, buffer=nl.sbuf)
++                    for i in range(4):
++                        ps = nl.ndarray((128, C), dtype=nl.float32, buffer=nl.psum)
++                        for kt in range(16):
++                            _mm(dst=ps, stationary=wo_sb[:, (i * 16 + kt) * 128:(i * 16 + kt + 1) * 128],
++                                           moving=oc[:, kt, :])
++                        nisa.tensor_tensor(dst=ho[:, i, :], data1=hc[:, i, :], data2=ps, op=nl.add)
++                    _hd(dst=h[:, nl.ds(pid * 4, 4), nl.ds(t0, C)], src=ho)
++                nisa.core_barrier(data=h, cores=(0, 1))
++                # ================= D: norm2 + gate/up + SiLU*up
++                w2 = nl.ndarray((128, HT), dtype=nl.float32, buffer=nl.sbuf)
++                _hd(dst=w2, src=ln2[l])
++                if HOIST < S and not PREF:
++                    wg = _load_w(wgu[l, pid], 2 * ITL * HT * 128)
++                if HOIST < S and PREF:
++                    wd_sb = _load_w(wd_p[l, pid], 4 * 24 * 128, PWQ)
++                for c in range(NC):
++                    t0 = c * C
++                    hc = nl.ndarray((128, HT, C), dtype=nl.float32, buffer=nl.sbuf)
++                    _hd(dst=hc, src=h[:, :, nl.ds(t0, C)])
++                    x2 = _norm_chunk(hc, w2, ones, C, onesb)
++                    if DPIPE:
++                        _phase_d_pipe(x2, wg, act_s, pid, t0, C)
++                    else:
++                        for i in range(ITL):
++                            pg = nl.ndarray((128, C), dtype=nl.float32, buffer=nl.psum)
++                            for kt in range(HT):
++                                _mm(dst=pg, stationary=wg[:, (i * HT + kt) * 128:(i * HT + kt + 1) * 128], moving=x2[:, kt, :])
++                            pu = nl.ndarray((128, C), dtype=nl.float32, buffer=nl.psum)
++                            for kt in range(HT):
++                                _mm(dst=pu, stationary=wg[:, ((ITL + i) * HT + kt) * 128:((ITL + i) * HT + kt + 1) * 128],
++                                               moving=x2[:, kt, :])
++                            sg = nl.ndarray((128, C), dtype=nl.float32, buffer=nl.sbuf)
++                            nisa.activation(dst=sg, op=nl.silu, data=pg)
++                            ab = nl.ndarray((128, C), dtype=nl.bfloat16, buffer=nl.sbuf)
++                            nisa.tensor_tensor(dst=ab, data1=sg, data2=pu, op=nl.multiply)
++                            _hd(dst=act_s[pid * ITL + i, :, nl.ds(t0, C)], src=ab)
++                nisa.core_barrier(data=act_s, cores=(0, 1))
++                # ================= E: down (N-split) + residual
++                if HOIST < S and not PREF:
++                    wd_sb = _load_w(wd_p[l, pid], 4 * 24 * 128)
++                for c in range(NC):
++                    t0 = c * C
++                    ac = nl.ndarray((128, 24, C), dtype=nl.bfloat16, buffer=nl.sbuf)
++                    for i in range(24):
++                        _hd(dst=ac[:, i, :], src=act_s[i, :, nl.ds(t0, C)])
++                    hc = nl.ndarray((128, 4, C), dtype=nl.float32, buffer=nl.sbuf)
++                    _hd(dst=hc, src=h[:, nl.ds(pid * 4, 4), nl.ds(t0, C)])
++                    ho = nl.ndarray((128, 4, C), dtype=nl.float32, buffer=nl.sbuf)
++                    for i in range(4):
++                        ps = nl.ndarray((128, C), dtype=nl.float32, buffer=nl.psum)
++                        for kt in range(24):
++                            _mm(dst=ps, stationary=wd_sb[:, (i * 24 + kt) * 128:(i * 24 + kt + 1) * 128],
++                                           moving=ac[:, kt, :])
++                        nisa.tensor_tensor(dst=ho[:, i, :], data1=hc[:, i, :], data2=ps, op=nl.add)
++                    _hd(dst=h[:, nl.ds(pid * 4, 4), nl.ds(t0, C)], src=ho)
++                nisa.core_barrier(data=h, cores=(0, 1))
+ 
+     pos_out = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.shared_hbm)
+     if STAGE == 1 or STAGE == 2 or STAGE == 4:

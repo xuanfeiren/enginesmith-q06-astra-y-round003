@@ -1,0 +1,60 @@
+--- a/kernels/prefill_lnc2.py
++++ b/kernels/prefill_lnc2.py
+@@ -252,12 +252,12 @@
+     _hd(dst=kw,src=kn[l].ap(pattern=[[0,128],[1,128]],offset=0))
+     cs_l=[]
+     sn_l=[]
+-    TMAX=cosT.shape[1]
++    TMAX=cosT.shape[0]
+     for qb in range(C//128):
+         cs=nl.ndarray((128,128),dtype=nl.float32,buffer=nl.sbuf)
+         sn=nl.ndarray((128,128),dtype=nl.float32,buffer=nl.sbuf)
+-        _hd(dst=cs,src=cosT.ap(pattern=[[1,128],[TMAX,128]],offset=t0+qb*128))
+-        _hd(dst=sn,src=sinT.ap(pattern=[[1,128],[TMAX,128]],offset=t0+qb*128))
++        _hd(dst=cs,src=cosT[t0+qb*128:t0+(qb+1)*128,:])
++        _hd(dst=sn,src=sinT[t0+qb*128:t0+(qb+1)*128,:])
+         nisa.tensor_scalar(dst=sn[:,0:64],data=sn[:,0:64],op0=nl.multiply,operand0=-1.0)
+         cs_l.append(cs)
+         sn_l.append(sn)
+@@ -361,10 +361,11 @@
+                 hseen = nl.ndarray((2, 128, HT, C), dtype=nl.float32, buffer=nl.shared_hbm)
+                 _hd(dst=hseen[pid], src=hc)
+             x1 = _norm_chunk(hc, w1, ones, C, onesb)
+-            cs = nl.ndarray((128, C), dtype=nl.float32, buffer=nl.sbuf)
+-            _hd(dst=cs, src=cosT[:, nl.ds(t0, C)])
+-            sn = nl.ndarray((128, C), dtype=nl.float32, buffer=nl.sbuf)
+-            _hd(dst=sn, src=sinT[:, nl.ds(t0, C)])
++            if S != 4096 or STAGE != 2:
++                cs = nl.ndarray((128, C), dtype=nl.float32, buffer=nl.sbuf)
++                _hd(dst=cs, src=cosT[:, nl.ds(t0, C)])
++                sn = nl.ndarray((128, C), dtype=nl.float32, buffer=nl.sbuf)
++                _hd(dst=sn, src=sinT[:, nl.ds(t0, C)])
+             if S == 4096 and STAGE == 2:
+                 _phase_a_row(x1,wq,qn,kn,cosT,sinT,qT_s,kT_s,v_s,kcache,vcache,l,pid,t0,C,NT0)
+                 continue
+--- a/host/engine.cpp
++++ b/host/engine.cpp
+@@ -301,6 +301,12 @@
+     }
+     dev.write("cos", cs.data(), cs.size() * 4); dev.write("sin", sn.data(), sn.size() * 4);
+     dev.write("cosT", csT.data(), csT.size() * 4); dev.write("sinT", snT.data(), snT.size() * 4);
++    std::vector<float> csR((size_t)TMAX*128), snR((size_t)TMAX*128);
++    for (int t=0; t<TMAX; ++t) for (int d=0; d<128; ++d) {
++      csR[(size_t)t*128+d] = csT[(size_t)d*TMAX+t];
++      snR[(size_t)t*128+d] = snT[(size_t)d*TMAX+t];
++    }
++    dev.write("cosR", csR.data(), csR.size()*4); dev.write("sinR", snR.data(), snR.size()*4);
+   }
+ 
+   void init(const std::string& dir) {
+@@ -328,7 +334,9 @@
+       v.push_back(bind("pf_emb" + sfx, -1, rn));
+       // buckets <= SB_MAX: the SBUF-resident layer (prefill_sb.py, decode weight layouts); else the phased one
+       const char* lay = s <= SB_MAX ? "pf_sb" : s <= SBC_MAX ? "pf_sbc" : "pf_layer";
+-      for (int l = 0; l < L - 1; l++) v.push_back(bind(lay + sfx, l, rn));
++      auto row_rn = rn;
++      if (s == 4096) { row_rn["cosT"] = "cosR"; row_rn["sinT"] = "sinR"; }
++      for (int l = 0; l < L - 1; l++) v.push_back(bind(lay + sfx, l, row_rn));
+       // last layer: its KV cache writes for every prompt token (pf_kv), then the rest of it for the last token only,
+       // the LM head and the argmax (pf_tail, the decode layer code at pos = plen - 1)
+       v.push_back(bind("pf_kv" + sfx, L - 1, rn));

@@ -1,0 +1,13 @@
+--- a/kernels/attn_prefill.py
++++ b/kernels/attn_prefill.py
+@@ -243,8 +243,8 @@
+     eT = eT_l[pi]
+     j0 = 0
+     while j0 <= i and (DT == 1 or (DT == 2 and NB >= 8)) and i + 1 > DTMIN:
+-        nj = 4
+-        if i + 1 - j0 < 4:
++        nj = 32
++        if i + 1 - j0 < 32:
+             nj = i + 1 - j0
+         K = (i + 1) * 128
+         NBT = eT.shape[1]

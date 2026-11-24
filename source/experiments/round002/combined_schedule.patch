@@ -1,0 +1,139 @@
+--- a/kernels/attn_prefill.py
++++ b/kernels/attn_prefill.py
+@@ -234,6 +234,82 @@
+             _hd(dst=oT[pid * NQL + 2 * g + h2, :, i * 128:(i + 1) * 128], src=ob[:, h2 * 128:(h2 + 1) * 128])
+ 
+ 
++def _ap_transpose(n, items, e_l, rinv_l, eT_l, vts, idf, ones, oT, pid, NB, osb=None):
++    g = items[n][0]
++    i = items[n][1]
++    hh = items[n][2]
++    e = e_l[n]
++    pi = n // 2
++    eT = eT_l[pi]
++    j0 = 0
++    while j0 <= i and (DT == 1 or (DT == 2 and NB >= 8)) and i + 1 > DTMIN:
++        nj = 4
++        if i + 1 - j0 < 4:
++            nj = i + 1 - j0
++        K = (i + 1) * 128
++        NBT = eT.shape[1]
++        nisa.dma_transpose(dst=eT.ap([[NBT * 256, 128], [1, 1], [256, nj], [1, 128]], offset=j0 * 256 + hh * 128),
++                           src=e.ap([[K, 128], [1, 1], [128, nj], [1, 128]], offset=j0 * 128))
++        j0 += nj
++    while j0 <= i:
++        nj = 4
++        if i + 1 - j0 < 4:
++            nj = i + 1 - j0
++        tp = nl.ndarray((128, 4, 128), dtype=nl.bfloat16, buffer=nl.psum)
++        for jj in range(nj):
++            nisa.nc_transpose(dst=tp[:, jj, :], data=e[:, (j0 + jj) * 128:(j0 + jj + 1) * 128],
++                              engine=nisa.engine.tensor)
++        if CPE == 1:
++            nisa.tensor_copy(dst=eT[:, j0:j0 + nj, hh * 128:(hh + 1) * 128], src=tp[:, 0:nj, :],
++                             engine=nisa.engine.gpsimd)
++        elif CPE == 2 or (CPE == 3 and (j0 // 4) % 2 == 1):
++            nisa.activation(dst=eT[:, j0:j0 + nj, hh * 128:(hh + 1) * 128], op=nl.copy, data=tp[:, 0:nj, :])
++        else:
++            nisa.tensor_copy(dst=eT[:, j0:j0 + nj, hh * 128:(hh + 1) * 128], src=tp[:, 0:nj, :])
++        j0 += nj
++
++
++def _ap_pv(n, items, e_l, rinv_l, eT_l, vts, idf, ones, oT, pid, NB, osb=None):
++    g = items[n][0]
++    i = items[n][1]
++    hh = items[n][2]
++    pi = n // 2
++    eT = eT_l[pi]
++    if hh == 1:
++        rinv = nl.ndarray((128, 2), dtype=nl.float32, buffer=nl.sbuf)
++        nisa.reciprocal(dst=rinv, data=rinv_l[pi])
++        po = nl.ndarray((D, 256), dtype=nl.float32, buffer=nl.psum)
++        for j in range(i + 1):
++            nisa.nc_matmul(dst=po, stationary=vts[g][:, j, :], moving=eT[:, j, :])
++        dgm = nl.ndarray((128, 256), dtype=nl.float32, buffer=nl.sbuf)
++        if DG1:
++            nisa.tensor_tensor(dst=dgm, data1=idf.ap(pattern=[[128, 128], [0, 2], [1, 128]], offset=0),
++                               data2=rinv.ap(pattern=[[2, 128], [1, 2], [0, 128]], offset=0), op=nl.multiply)
++        else:
++            for h2 in range(2):
++                nisa.tensor_scalar(dst=dgm[:, h2 * 128:(h2 + 1) * 128], data=idf, op0=nl.multiply,
++                                   operand0=rinv[:, h2:h2 + 1], engine=OFFE)
++        pb = nl.ndarray((D, 256), dtype=nl.float32, buffer=nl.psum)
++        nisa.nc_matmul(dst=pb, stationary=ones, moving=dgm, is_stationary_onezero=True)
++        if osb is not None:
++            # SBUF output [128 d, 8 local heads, S]: the pair's two heads are adjacent
++            bc = nl.ndarray((D, 256), dtype=nl.float32, buffer=nl.sbuf)
++            nisa.tensor_copy(dst=bc, src=pb)
++            S_ = osb.shape[2]
++            nisa.tensor_tensor(dst=osb.ap(pattern=[[8 * S_, 128], [S_, 2], [1, 128]], offset=2 * g * S_ + i * 128),
++                               data1=po, data2=bc, op=nl.multiply)
++            return
++        ob = nl.ndarray((D, 256), dtype=nl.bfloat16, buffer=nl.sbuf)
++        if NOBC:
++            nisa.tensor_tensor(dst=ob, data1=po, data2=pb, op=nl.multiply)
++        else:
++            bc = nl.ndarray((D, 256), dtype=nl.float32, buffer=nl.sbuf)
++            nisa.tensor_copy(dst=bc, src=pb)
++            nisa.tensor_tensor(dst=ob, data1=po, data2=bc, op=nl.multiply)
++        for h2 in range(2):
++            _hd(dst=oT[pid * NQL + 2 * g + h2, :, i * 128:(i + 1) * 128], src=ob[:, h2 * 128:(h2 + 1) * 128])
++
++
+ def attn_prefill_pipe(qT, kT, v, oT, pid, S, DEPTH=0):
+     """attn_prefill with the work items (kv head, query block, q head) software-pipelined in program order: the
+     QK matmuls of item n + DEPTH, the softmax of item n + 1 and the transposes / PV of item n are interleaved, so
+@@ -328,7 +404,8 @@
+         _ap_s3(n, items, e_l, rinv_l, eT_l, vts, idf, ones, 0, 0, NB, osb)
+ 
+ 
+-BDEPTH = int(_os.environ.get('AP_BDEPTH', '2'))
++BDEPTH = int(_os.environ.get('AP_BDEPTH', '3'))
++TPDEPTH = int(_os.environ.get('AP_TPDEPTH', '1'))
+ NMACT = int(_os.environ.get('AP_NMACT', '1'))   # attn_prefill_big: -scale * max on ScalarE (1,104 -> 1,090 us)
+ DG1 = int(_os.environ.get('AP_DG1', '0'))
+ ACC = int(_os.environ.get('AP_ACC', '1'))   # attn_prefill_big: row max chained in the VectorE accumulator
+@@ -400,24 +477,22 @@
+     sc = sc_l[n]
+     mx = mx_l[n][0]
+     ns = mx_l[n][1]
+-    m = nl.ndarray((128, 1), dtype=nl.float32, buffer=nl.sbuf)
++    m = mx[:, 0:1]
+     if ns > 1:
++        m = nl.ndarray((128, 1), dtype=nl.float32, buffer=nl.sbuf)
+         nisa.tensor_reduce(dst=m, op=nl.maximum, data=mx[:, 0:ns], axis=1)
+-    else:
+-        nisa.tensor_copy(dst=m, src=mx[:, 0:1])
+     nm = nl.ndarray((128, 1), dtype=nl.float32, buffer=nl.sbuf)
+     if NMACT:
+         nisa.activation(dst=nm, op=nl.copy, data=m, scale=-SCALE)
+     else:
+         nisa.tensor_scalar(dst=nm, data=m, op0=nl.multiply, operand0=-SCALE, engine=nisa.engine.vector)
+-    e = nl.ndarray((128, K), dtype=nl.bfloat16, buffer=nl.sbuf)
+-    sm = nl.ndarray((128, 1), dtype=nl.float32, buffer=nl.sbuf)
+-    nisa.activation_reduce(dst=e, op=nl.exp, data=sc, reduce_op=nl.add, reduce_res=sm, bias=nm, scale=SCALE)
+     pi = n // 2
+     if hh == 0:
+         rinv_l[pi] = nl.ndarray((128, 2), dtype=nl.float32, buffer=nl.sbuf)
+         eT_l[pi] = nl.ndarray((128, NB, 256), dtype=nl.bfloat16, buffer=nl.sbuf)
+-    nisa.reciprocal(dst=rinv_l[pi][:, hh:hh + 1], data=sm)
++    e = nl.ndarray((128, K), dtype=nl.bfloat16, buffer=nl.sbuf)
++    nisa.activation_reduce(dst=e, op=nl.exp, data=sc, reduce_op=nl.add,
++                           reduce_res=rinv_l[pi][:, hh:hh + 1], bias=nm, scale=SCALE)
+     e_l[n] = e
+ 
+ 
+@@ -481,9 +556,12 @@
+         m2 = n - 1
+         if m2 >= 0 and m2 < N:
+             _ab_s2(m2, items, sc_l, mx_l, e_l, rinv_l, eT_l, NB)
++        mt = n - TPDEPTH
++        if mt >= 0 and mt < N:
++            _ap_transpose(mt, items, e_l, rinv_l, eT_l, vts, idf, ones, oT, pid, NB)
+         m3 = n - DEPTH
+         if m3 >= 0:
+-            _ap_s3(m3, items, e_l, rinv_l, eT_l, vts, idf, ones, oT, pid, NB)
++            _ap_pv(m3, items, e_l, rinv_l, eT_l, vts, idf, ones, oT, pid, NB)
+ 
+ 
+ @nki.jit

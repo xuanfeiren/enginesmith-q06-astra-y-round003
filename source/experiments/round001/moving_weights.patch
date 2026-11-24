@@ -1,0 +1,38 @@
+--- a/kernels/prefill_lnc2.py
++++ b/kernels/prefill_lnc2.py
+@@ -197,8 +197,8 @@
+     qb, nt = items[n]
+     ps = nl.ndarray((128, 4, 128), dtype=nl.float32, buffer=nl.psum)
+     for kt in range(HT):
+-        nisa.nc_matmul(dst=ps, stationary=x1[:, kt, qb*128:(qb+1)*128],
+-                       moving=wq.ap(pattern=[[16*HT*128,128],[HT*128,4],[1,128]], offset=(nt*HT+kt)*128))
++        nisa.nc_matmul(dst=ps.reshape((128,512)), stationary=x1[:, kt, qb*128:(qb+1)*128],
++                       moving=wq[:,(kt*16+nt)*128:(kt*16+nt+4)*128])
+     ps_l[n] = ps
+ 
+ 
+--- a/host/engine.cpp
++++ b/host/engine.cpp
+@@ -281,6 +281,13 @@
+     }
+     dev.write("ln1", ln1.data(), ln1.size() * 4); dev.write("ln2", ln2.data(), ln2.size() * 4);
+     dev.write("qn", qn.data(), qn.size() * 4); dev.write("kn", kn.data(), kn.size() * 4);
++    auto wqr = bf(wqkv.size());
++    for (int lc=0; lc<L*2; ++lc) for (int p=0; p<128; ++p)
++      for (int nt=0; nt<16; ++nt) for (int kt=0; kt<8; ++kt) {
++        size_t off=(size_t)lc*sq+(size_t)p*16*8*128;
++        memcpy(&wqr[off+(kt*16+nt)*128], &wqkv[off+(nt*8+kt)*128], 128*2);
++      }
++    dev.write("wqkvR", wqr.data(), wqr.size()*2);
+     dev.write("wqkv", wqkv.data(), wqkv.size() * 2); dev.write("wo", wo.data(), wo.size() * 2);
+     dev.write("wgu", wgu.data(), wgu.size() * 2); dev.write("wd", wd.data(), wd.size() * 2);
+     dev.write("wo_p", wop.data(), wop.size() * 2); dev.write("wd_p", wdp.data(), wdp.size() * 2);
+@@ -335,7 +342,7 @@
+       // buckets <= SB_MAX: the SBUF-resident layer (prefill_sb.py, decode weight layouts); else the phased one
+       const char* lay = s <= SB_MAX ? "pf_sb" : s <= SBC_MAX ? "pf_sbc" : "pf_layer";
+       auto row_rn = rn;
+-      if (s == 4096) { row_rn["cosT"] = "cosR"; row_rn["sinT"] = "sinR"; }
++      if (s == 4096) { row_rn["wqkv"] = "wqkvR"; row_rn["cosT"] = "cosR"; row_rn["sinT"] = "sinR"; }
+       for (int l = 0; l < L - 1; l++) v.push_back(bind(lay + sfx, l, row_rn));
+       // last layer: its KV cache writes for every prompt token (pf_kv), then the rest of it for the last token only,
+       // the LM head and the argmax (pf_tail, the decode layer code at pos = plen - 1)
